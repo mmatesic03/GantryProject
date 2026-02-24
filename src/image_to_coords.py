@@ -40,8 +40,7 @@ def resample_closed_polyline(points: np.ndarray, spacing: float) -> np.ndarray:
     if total_len == 0:
         return points[:1].copy()
 
-    # Distances where we want points (leave off total_len to avoid duplicate;
-    # we'll close the loop manually)
+    # Distances where we want points (start at 0, end before total_len to avoid duplicate point at the end)
     sample_dists = np.arange(0, total_len, spacing, dtype=np.float64)
 
     cumlen = np.concatenate([[0.0], np.cumsum(seg_lens)])
@@ -94,7 +93,7 @@ def map_paths_to_a4_mm(
       mapped_paths_mm: list of paths, each shape (N,2) with [x_mm, y_mm]
       info: dict with transform/debug values
     """
-    img_h_px, img_w_px = image_shape  # note: image shape is (rows, cols) = (h, w)
+    img_h_px, img_w_px = image_shape  # note: image shape is (h, w)
 
     drawable_w_mm = page_w_mm - 2 * margin_mm
     drawable_h_mm = page_h_mm - 2 * margin_mm
@@ -120,7 +119,7 @@ def map_paths_to_a4_mm(
     mapped_paths_mm = []
 
     for path_px in paths_px:
-        # path_px columns: [x_px, y_px], image origin top-left
+        # path_px columns: [x_px, y_px]
         x_px = path_px[:, 0]
         y_px = path_px[:, 1]
 
@@ -128,7 +127,7 @@ def map_paths_to_a4_mm(
         x_mm = x_px * s + x_offset_mm
         y_top_mm = y_px * s + y_offset_mm
 
-        # Flip y so origin becomes bottom-left of the page
+        # Flip y so origin becomes bottom-left
         y_mm = page_h_mm - y_top_mm
 
         path_mm = np.column_stack([x_mm, y_mm])
@@ -218,7 +217,7 @@ def detect_sharp_corners_on_closed_contour(
     if len(points) < (2 * window + 3):
         return np.array([], dtype=int), np.empty((0, 2), dtype=np.float64)
 
-    # Work on the unique part only (drop duplicate closing point if present)
+    # Work on the unique part only (drop duplicate end point if present)
     if np.allclose(points[0], points[-1]):
         pts = points[:-1]
     else:
@@ -235,15 +234,15 @@ def detect_sharp_corners_on_closed_contour(
         i_prev = (i - window) % n
         i_next = (i + window) % n
 
-        v1 = pts[i_prev] - pts[i]   # vector from current point to previous neighbourhood point
-        v2 = pts[i_next] - pts[i]   # vector from current point to next neighbourhood point
+        v1 = pts[i_prev] - pts[i]   # current point to previous point
+        v2 = pts[i_next] - pts[i]   # current point to next point
 
         n1 = np.linalg.norm(v1)
         n2 = np.linalg.norm(v2)
         if n1 < 1e-9 or n2 < 1e-9:
             continue
 
-        # Interior angle between the two local directions
+        # angle between the two local directions
         cosang = np.dot(v1, v2) / (n1 * n2)
         cosang = np.clip(cosang, -1.0, 1.0)
         angle_deg = np.degrees(np.arccos(cosang))
@@ -259,8 +258,7 @@ def detect_sharp_corners_on_closed_contour(
     candidate_idx = np.array(candidate_idx, dtype=int)
     candidate_angle = np.array(candidate_angle, dtype=np.float64)
 
-    # Non-maximum suppression style step (for corners, we want the SHARPEST point in a neighbourhood)
-    # Since sharper = smaller angle, sort ascending by angle.
+    # we want the SHARPEST point in a neighbourhood, so sort by angle ascending and suppress nearby duplicates
     order = np.argsort(candidate_angle)
 
     selected = []
@@ -351,7 +349,7 @@ def merge_preserved_points_into_sampled_closed_path(
     # Sort by arc position
     combined.sort(key=lambda t: t[0])
 
-    # keep corners preferentially if same location (e.g. if a corner was very close to a sampled point, we want to keep the corner exact)
+    # keep corners if same location (e.g. if a corner was very close to a sampled point, we want to keep the corner exact)
     dedup = []
     tol = 1e-6
     for item in combined:
@@ -384,12 +382,12 @@ def main():
     output_dir = repo_root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- User-tunable parameters ----
+    # Tunable parameters
     point_spacing_px = 15.0
     page_w_mm = 210.0
     page_h_mm = 297.0
     margin_mm = 10.0
-    # ---- Corner preservation tuning ----
+    # Corner preservation parameters
     enable_corner_preservation = True
     corner_angle_threshold_deg = 110
     corner_window = 8                   # local neighbourhood size along contour
@@ -403,7 +401,7 @@ def main():
 
     print(f"Loaded image with shape: {img.shape}")  # (h, w)
 
-    # Threshold: black shapes become foreground (white)
+    # Threshold to binary (inverted: contours become white on black background)
     _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
 
     # Find external contours only (separate disconnected bodies)
@@ -414,10 +412,10 @@ def main():
         print("No contours found. Check thresholding or input image.")
         return
 
-    # Sort largest-first for consistency
+    # Sort contours by area (largest first) for consistent processing order
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-    # Overlays for verification
+    # Overlays
     overlay_raw = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     cv2.drawContours(overlay_raw, contours, -1, (0, 0, 255), 2)
 
@@ -435,7 +433,7 @@ def main():
         # Base uniform contour resampling (curve-preserving backbone)
         sampled_pts_uniform = resample_closed_polyline(raw_pts, point_spacing_px)
 
-        # Optional feature-aware corner preservation
+        # Corner detection and preservation
         if enable_corner_preservation:
             corner_idx_raw, corner_pts = detect_sharp_corners_on_closed_contour(
                 raw_pts,
@@ -471,7 +469,7 @@ def main():
             approx_spacing = perimeter / (len(sampled_pts) - 1)
             print(f"  Approx achieved spacing (px): {approx_spacing:.2f}")
 
-        # Draw sampled path on pixel overlay (debug/verification)
+        # Draw sampled path on pixel overlay
         for j in range(len(sampled_pts) - 1):
             p1 = tuple(np.round(sampled_pts[j]).astype(int))
             p2 = tuple(np.round(sampled_pts[j + 1]).astype(int))
@@ -493,11 +491,11 @@ def main():
                 1,
                 cv2.LINE_AA,
             )
-        # Draw detected corners (magenta) for troubleshooting
+        # Draw detected corners
         for p in corner_pts:
             x, y = np.round(p).astype(int)
-            cv2.circle(overlay_sampled, (x, y), 5, (255, 0, 255), 2)  # magenta ring
-    # ---- NEW: Map sampled pixel paths to A4 mm coordinates ----
+            cv2.circle(overlay_sampled, (x, y), 5, (255, 0, 255), 2)
+    # Map sampled pixel paths to A4 coordinates
     all_sampled_paths_mm, tf_info = map_paths_to_a4_mm(
         all_sampled_paths_px,
         image_shape=img.shape,  # (h, w)
@@ -543,7 +541,7 @@ def main():
     fig.savefig(output_dir / "resampling_summary.png", dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-    # Save sampled pixel coordinates (for debug)
+    # Save sampled pixel coordinates
     coords_px_out = output_dir / "sampled_points_px.txt"
     with open(coords_px_out, "w", encoding="utf-8") as f:
         f.write("# Sampled contour points in pixel coordinates (x_px, y_px)\n")
@@ -555,7 +553,7 @@ def main():
 
     print(f"\nSaved sampled point list (px) to: {coords_px_out}")
 
-    # ---- NEW: Save sampled A4 mm coordinates ----
+    # Save sampled A4 mm coordinates
     coords_mm_out = output_dir / "sampled_points_a4_mm.txt"
     with open(coords_mm_out, "w", encoding="utf-8") as f:
         f.write("# Sampled contour points mapped to A4 coordinates (x_mm, y_mm)\n")
