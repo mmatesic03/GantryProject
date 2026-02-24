@@ -387,11 +387,15 @@ def main():
     page_w_mm = 210.0
     page_h_mm = 297.0
     margin_mm = 10.0
+    # Contour retrieval mode / filtering
+    contour_mode = "all"   # "external" or "all"
+    min_contour_area_px2 = 20.0
+    min_contour_perimeter_px = 20.0
     # Corner preservation parameters
     enable_corner_preservation = True
-    corner_angle_threshold_deg = 110
+    corner_angle_threshold_deg = 140
     corner_window = 8                   # local neighbourhood size along contour
-    corner_min_separation = 20          # suppress duplicate detections near same corner
+    corner_min_separation = 17          # suppress duplicate detections near same corner
     print(f"Trying to load: {image_path}")
     print(f"Exists: {image_path.exists()}")
 
@@ -405,14 +409,57 @@ def main():
     _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
 
     # Find external contours only (separate disconnected bodies)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        # Contour retrieval mode:
+    # - "external": only outer boundaries
+    # - "all": all contours (including holes / nested boundaries)
+    if contour_mode == "external":
+        retrieval_flag = cv2.RETR_EXTERNAL
+    elif contour_mode == "all":
+        retrieval_flag = cv2.RETR_TREE
+    else:
+        raise ValueError(f"Unknown contour_mode: {contour_mode}")
 
-    print(f"Contours found: {len(contours)}")
+    contours, hierarchy = cv2.findContours(binary, retrieval_flag, cv2.CHAIN_APPROX_NONE)
+
+    print(f"Contours found (raw): {len(contours)}")
     if len(contours) == 0:
         print("No contours found. Check thresholding or input image.")
         return
 
-    # Sort contours by area (largest first) for consistent processing order
+    # Filter tiny/noisy contours
+    filtered_contours = []
+    filtered_meta = []  # optional debug info (area/perimeter/index/hierarchy row)
+
+    for ci, cnt in enumerate(contours):
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, closed=True)
+
+        if area < min_contour_area_px2:
+            continue
+        if perimeter < min_contour_perimeter_px:
+            continue
+
+        filtered_contours.append(cnt)
+
+        h_row = None
+        if hierarchy is not None:
+            # hierarchy shape is usually (1, N, 4): [next, prev, first_child, parent]
+            h_row = hierarchy[0, ci].copy()
+        filtered_meta.append((ci, area, perimeter, h_row))
+
+    contours = filtered_contours
+
+    print(f"Contours kept after filtering: {len(contours)}")
+    print(
+        f"  Filters -> min_area={min_contour_area_px2:.1f} px^2, "
+        f"min_perimeter={min_contour_perimeter_px:.1f} px"
+    )
+
+    if len(contours) == 0:
+        print("All contours were filtered out. Reduce area/perimeter thresholds.")
+        return
+
+    # Sort largest-first for consistency (debug-friendly)
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
     # Overlays
