@@ -40,6 +40,7 @@ class SegmentationResult:
     mode_used: str
     model_path_used: str | None
     notes: list[str]
+    diagnostics: dict | None = None
 
 
 @dataclass
@@ -89,6 +90,12 @@ class HeuristicSegmenter(BaseSegmenter):
                 "Heuristic segmentation used grayscale thresholding, cleanup, "
                 "skeletonisation, and endpoint/junction/corner detection."
             ],
+            diagnostics={
+                "decode_mode": "heuristic_threshold",
+                "line_pixel_count": int(np.count_nonzero(line_mask)),
+                "node_pixel_count": int(np.count_nonzero(node_mask)),
+                "line_pixel_fraction": float(np.count_nonzero(line_mask) / line_mask.size),
+            },
         )
 
 
@@ -100,8 +107,9 @@ class MLSegmenter(BaseSegmenter):
     - PyTorch .pt/.pth, either TorchScript or a state_dict for TinyUNet
     - TensorFlow/Keras .h5/.keras
 
-    Expected model output is either one channel (line probability) or three
-    channels ordered as background, nodes/corners, lines.
+    Expected model output is either one channel (line probability) or a
+    multiclass output. For multiclass checkpoints, class_map metadata is used
+    when present; otherwise the default order is background, line, node/corner.
     """
 
     def __init__(self, model_path: Path, threshold: float = 0.5):
@@ -136,12 +144,14 @@ class MLSegmenter(BaseSegmenter):
 
         gray = load_grayscale(image_path)
         tensor = torch.from_numpy(gray.astype(np.float32) / 255.0)[None, None, :, :]
+        class_map = None
 
         try:
             model = torch.jit.load(str(self.model_path), map_location="cpu")
         except Exception:
             checkpoint = torch.load(str(self.model_path), map_location="cpu")
             model_config = checkpoint.get("model_config", {}) if isinstance(checkpoint, dict) else {}
+            class_map = checkpoint.get("class_map") if isinstance(checkpoint, dict) else None
             model = build_stroke_unet(
                 num_classes=int(model_config.get("num_classes", 3)),
                 base_channels=int(model_config.get("base_channels", 16)),
@@ -159,9 +169,15 @@ class MLSegmenter(BaseSegmenter):
         model.eval()
         with torch.no_grad():
             output = model(tensor)
-            probs = output_to_probabilities(output.detach().cpu().numpy())
+            output_np = output.detach().cpu().numpy()
+            probs = output_to_probabilities(output_np)
 
-        line_mask, node_mask = masks_from_model_probabilities(probs, self.threshold)
+        line_mask, node_mask, diagnostics = masks_from_model_probabilities(
+            probs,
+            self.threshold,
+            class_map=class_map,
+            output_shape=tuple(output_np.shape),
+        )
         return SegmentationResult(
             gray=gray,
             line_mask=line_mask,
@@ -169,6 +185,7 @@ class MLSegmenter(BaseSegmenter):
             mode_used="ML",
             model_path_used=str(self.model_path),
             notes=["PyTorch U-Net-style segmentation inference completed."],
+            diagnostics=diagnostics,
         )
 
     def _segment_tensorflow(self, image_path: Path) -> SegmentationResult:
@@ -179,7 +196,12 @@ class MLSegmenter(BaseSegmenter):
         model = tf.keras.models.load_model(str(self.model_path), compile=False)
         output = model(tensor, training=False).numpy()
         probs = output_to_probabilities(output)
-        line_mask, node_mask = masks_from_model_probabilities(probs, self.threshold)
+        line_mask, node_mask, diagnostics = masks_from_model_probabilities(
+            probs,
+            self.threshold,
+            class_map=None,
+            output_shape=tuple(output.shape),
+        )
         return SegmentationResult(
             gray=gray,
             line_mask=line_mask,
@@ -187,6 +209,7 @@ class MLSegmenter(BaseSegmenter):
             mode_used="ML",
             model_path_used=str(self.model_path),
             notes=["TensorFlow/Keras segmentation inference completed."],
+            diagnostics=diagnostics,
         )
 
 
@@ -219,16 +242,73 @@ def output_to_probabilities(output: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-channels_first))
 
 
-def masks_from_model_probabilities(probs: np.ndarray, threshold: float) -> tuple[np.ndarray, np.ndarray]:
+def normalize_class_map(class_map: dict | None) -> dict[int, str]:
+    if not class_map:
+        return {0: "background", 1: "line", 2: "node_corner"}
+    normalized = {}
+    for key, value in class_map.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            index = int(value)
+            value = key
+        normalized[index] = str(value).lower()
+    return normalized
+
+
+def class_index_for(class_map: dict[int, str], names: tuple[str, ...], default: int) -> int:
+    for index, label in class_map.items():
+        if any(name in label for name in names):
+            return index
+    return default
+
+
+def masks_from_model_probabilities(
+    probs: np.ndarray,
+    threshold: float,
+    class_map: dict | None = None,
+    output_shape: tuple[int, ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    probability_threshold = threshold / 255.0 if threshold > 1 else threshold
     if probs.shape[0] >= 3:
-        node_mask = probs[1] >= threshold
-        line_mask = probs[2] >= threshold
+        normalized_class_map = normalize_class_map(class_map)
+        line_class = class_index_for(normalized_class_map, ("line",), default=1)
+        node_class = class_index_for(normalized_class_map, ("node", "corner"), default=2)
+        predicted = np.argmax(probs, axis=0)
+        line_mask = predicted == line_class
+        node_mask = predicted == node_class
+        diagnostics = {
+            "decode_mode": "multiclass_argmax",
+            "output_shape": list(output_shape) if output_shape is not None else None,
+            "probability_shape": list(probs.shape),
+            "class_map": normalized_class_map,
+            "line_class_index": line_class,
+            "node_class_index": node_class,
+            "line_pixel_count": int(np.count_nonzero(line_mask)),
+            "node_pixel_count": int(np.count_nonzero(node_mask)),
+            "line_pixel_fraction": float(np.count_nonzero(line_mask) / line_mask.size),
+            "line_probability_max": float(np.max(probs[line_class])) if line_class < probs.shape[0] else None,
+            "node_probability_max": float(np.max(probs[node_class])) if node_class < probs.shape[0] else None,
+            "threshold": threshold,
+            "threshold_used_for_decode": None,
+        }
     else:
-        line_mask = probs[0] >= threshold
+        line_mask = probs[0] >= probability_threshold
         skeleton = zhang_suen_thinning(line_mask)
         endpoints, junctions, corners, _ = detect_skeleton_nodes(skeleton)
         node_mask = endpoints | junctions | corners
-    return line_mask, node_mask
+        diagnostics = {
+            "decode_mode": "single_channel_threshold",
+            "output_shape": list(output_shape) if output_shape is not None else None,
+            "probability_shape": list(probs.shape),
+            "line_pixel_count": int(np.count_nonzero(line_mask)),
+            "node_pixel_count": int(np.count_nonzero(node_mask)),
+            "line_pixel_fraction": float(np.count_nonzero(line_mask) / line_mask.size),
+            "line_probability_max": float(np.max(probs[0])),
+            "threshold": threshold,
+            "threshold_used_for_decode": probability_threshold,
+        }
+    return line_mask, node_mask, diagnostics
 
 
 def load_grayscale(image_path: Path) -> np.ndarray:
@@ -1058,6 +1138,7 @@ def compute_command_metrics(
     transform_info: dict,
     graph: StrokeGraph,
     segmentation_notes: list[str],
+    segmentation_diagnostics: dict | None = None,
 ) -> dict:
     draw_distance = 0.0
     travel_distance = 0.0
@@ -1133,6 +1214,11 @@ def compute_command_metrics(
             "Corner candidate count is high relative to skeleton pixels. "
             "Consider lowering corner sensitivity or keeping corners debug-only."
         )
+    if segmentation_diagnostics and segmentation_mode_used == "ML":
+        if segmentation_diagnostics.get("line_pixel_count", 0) == 0:
+            warnings.append("ML line_mask is empty; graph extraction will produce no drawing commands.")
+        elif segmentation_diagnostics.get("line_pixel_fraction", 0.0) < 0.0005:
+            warnings.append("ML line_mask is extremely sparse; thresholding or class decoding may be wrong.")
 
     return {
         "schema": "stroke_pipeline_metrics_v1",
@@ -1160,6 +1246,7 @@ def compute_command_metrics(
         "segmentation_mode_used": segmentation_mode_used,
         "model_path_used": model_path_used,
         "segmentation_notes": segmentation_notes,
+        "segmentation_diagnostics": segmentation_diagnostics or {},
         "warnings": warnings,
         "graph": {
             "vertex_count": len(graph.vertices),
@@ -1371,11 +1458,17 @@ def choose_segmenter(args: argparse.Namespace, repo_root: Path) -> tuple[BaseSeg
 
     if mode in {"auto", "ml"}:
         if model_path is None:
-            notes.append("ML segmentation attempted, but no local model/checkpoint file was found.")
+            message = "ML segmentation attempted, but no local model/checkpoint file was found."
+            if mode == "ml":
+                raise FileNotFoundError(message)
+            notes.append(message)
         elif not MLSegmenter.framework_available_for(model_path):
-            notes.append(
+            message = (
                 f"ML segmentation attempted with {model_path}, but no compatible local ML framework is installed."
             )
+            if mode == "ml":
+                raise RuntimeError(message)
+            notes.append(message)
         else:
             notes.append(f"ML segmentation will use model: {model_path}")
             return MLSegmenter(model_path=model_path), notes, str(model_path)
@@ -1401,7 +1494,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         segmentation = segmenter.segment(image_path)
         segmentation.notes = setup_notes + segmentation.notes
     except Exception as exc:
-        if isinstance(segmenter, HeuristicSegmenter):
+        if isinstance(segmenter, HeuristicSegmenter) or args.segmentation_mode.lower() == "ml":
             raise
         fallback = HeuristicSegmenter(threshold=args.threshold)
         segmentation = fallback.segment(image_path)
@@ -1448,6 +1541,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         transform_info=transform_info,
         graph=graph,
         segmentation_notes=segmentation.notes,
+        segmentation_diagnostics=segmentation.diagnostics,
     )
 
     save_arduino_commands(commands, output_dir / "arduino_commands.txt")
@@ -1476,6 +1570,13 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         print(f"Model path: {segmentation.model_path_used}")
     for note in segmentation.notes:
         print(f"- {note}")
+    if segmentation.diagnostics:
+        print(
+            "Segmentation pixels: "
+            f"line={segmentation.diagnostics.get('line_pixel_count', 0)}, "
+            f"node={segmentation.diagnostics.get('node_pixel_count', 0)}, "
+            f"decode={segmentation.diagnostics.get('decode_mode', 'unknown')}"
+        )
     print(f"Strokes: {metrics['stroke_count']}")
     print(f"Average points/stroke: {metrics['average_points_per_stroke']:.2f}")
     print(f"Median points/stroke: {metrics['median_points_per_stroke']:.2f}")
