@@ -1,0 +1,72 @@
+{
+  "schema": "stroke_pipeline_metrics_v1",
+  "command_count": 8,
+  "stroke_count": 4,
+  "pen_down_drawing_distance_mm": 446.55737704918033,
+  "pen_up_travel_distance_mm": 272.8957277076888,
+  "total_movement_distance_mm": 719.4531047568692,
+  "estimated_draw_movement_time_s": 32.476900149031295,
+  "estimated_travel_movement_time_s": 12.128699009230614,
+  "estimated_pen_mode_change_settle_time_s": 9.8,
+  "estimated_total_plotting_time_s": 54.40559915826191,
+  "mode_change_count": 8,
+  "command_bounds_mm": {
+    "min_x_mm": 18.770491803278688,
+    "max_x_mm": 131.88524590163934,
+    "min_y_mm": 79.59016393442624,
+    "max_y_mm": 192.7049180327869
+  },
+  "bounds_validation_passed": true,
+  "bounds_validation_error": null,
+  "segmentation_mode_used": "ML attempted then fallback",
+  "model_path_used": null,
+  "segmentation_notes": [
+    "ML segmentation attempted, but no local model/checkpoint file was found.",
+    "Falling back to heuristic segmentation.",
+    "Heuristic segmentation used grayscale thresholding, cleanup, skeletonisation, and endpoint/junction/corner detection."
+  ],
+  "graph": {
+    "vertex_count": 4,
+    "edge_count": 4,
+    "skeleton_pixel_count": 1380,
+    "endpoint_count": 0,
+    "junction_pixel_count": 11,
+    "corner_pixel_count": 3
+  },
+  "gantry_mapping": {
+    "work_w_mm": 150.0,
+    "work_h_mm": 270.0,
+    "margin_mm": 5.0,
+    "drawable_w_mm": 140.0,
+    "drawable_h_mm": 260.0,
+    "img_w_px": 427,
+    "img_h_px": 396,
+    "scale_mm_per_px": 0.32786885245901637,
+    "used_w_mm": 140.0,
+    "used_h_mm": 129.83606557377047,
+    "x_offset_mm": 5.0,
+    "y_offset_mm": 70.08196721311477,
+    "centre_on_page": true
+  },
+  "firmware_constants": {
+    "BELT_PITCH_MM": 2.0,
+    "PULLEY_TEETH": 20.0,
+    "FULL_STEPS_PER_REV": 200.0,
+    "MICROSTEPS": 16.0,
+    "DRAW_SPEED": 1100.0,
+    "TRAVEL_SPEED": 1800.0,
+    "SERVO_DELAY_MS": 15.0,
+    "PEN_SETTLE_MS": 1000.0,
+    "PEN_UP_ANGLE": 95.0,
+    "PEN_DOWN_ANGLE": 80.0
+  },
+  "time_estimation_assumptions": {
+    "speed_units": "DRAW_SPEED and TRAVEL_SPEED are treated as AccelStepper steps/s.",
+    "steps_per_mm_formula": "(FULL_STEPS_PER_REV * MICROSTEPS) / (PULLEY_TEETH * BELT_PITCH_MM)",
+    "steps_per_mm": 80.0,
+    "draw_speed_mm_s": 13.75,
+    "travel_speed_mm_s": 22.5,
+    "pen_change_estimate": "Each mode change adds PEN_SETTLE_MS plus an approximate servo sweep time.",
+    "acceleration": "Acceleration and cornering dynamics are not modelled."
+  }
+}
