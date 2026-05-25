@@ -182,6 +182,8 @@ def render_training_pair(
     image_size: int = 128,
     line_width: int = 3,
     node_radius: int = 3,
+    corner_angle_threshold_deg: float = 135.0,
+    corner_stride: int = 2,
 ) -> tuple[np.ndarray, np.ndarray]:
     strokes = normalize_strokes(sample.strokes, image_size=image_size)
     line_mask = draw_line_mask(strokes, image_size=image_size, line_width=line_width)
@@ -190,7 +192,7 @@ def render_training_pair(
     for stroke in strokes:
         draw_node_disk(node_mask, stroke[0], node_radius)
         draw_node_disk(node_mask, stroke[-1], node_radius)
-        for corner in detect_vector_corners(stroke):
+        for corner in detect_vector_corners(stroke, angle_threshold_deg=corner_angle_threshold_deg, stride=corner_stride):
             draw_node_disk(node_mask, corner, node_radius)
 
     skeleton = zhang_suen_thinning(line_mask)
@@ -229,7 +231,104 @@ def synthetic_samples() -> list[QuickDrawSample]:
     ]
 
 
-def write_training_pairs(samples: Iterable[QuickDrawSample], processed_dir: Path, image_size: int, preview_count: int = 8) -> dict:
+def arc_points(
+    center: tuple[float, float],
+    radius: float,
+    start_deg: float,
+    end_deg: float,
+    count: int,
+) -> np.ndarray:
+    angles = np.linspace(math.radians(start_deg), math.radians(end_deg), count)
+    cx, cy = center
+    return np.column_stack([cx + radius * np.cos(angles), cy + radius * np.sin(angles)]).astype(np.float32)
+
+
+def rectangle_strokes(rng: np.random.Generator) -> list[np.ndarray]:
+    x0 = float(rng.uniform(20, 75))
+    y0 = float(rng.uniform(20, 75))
+    w = float(rng.uniform(95, 185))
+    h = float(rng.uniform(95, 185))
+    jitter = rng.normal(0, 2.0, size=(5, 2)).astype(np.float32)
+    return [np.array([[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h], [x0, y0]], dtype=np.float32) + jitter]
+
+
+def triangle_strokes(rng: np.random.Generator) -> list[np.ndarray]:
+    points = np.array(
+        [
+            [rng.uniform(40, 90), rng.uniform(175, 225)],
+            [rng.uniform(105, 150), rng.uniform(25, 75)],
+            [rng.uniform(175, 225), rng.uniform(175, 225)],
+        ],
+        dtype=np.float32,
+    )
+    return [np.vstack([points, points[0]])]
+
+
+def zigzag_strokes(rng: np.random.Generator) -> list[np.ndarray]:
+    count = int(rng.integers(4, 8))
+    xs = np.linspace(rng.uniform(25, 45), rng.uniform(205, 235), count)
+    ys = rng.uniform(45, 215, size=count)
+    return [np.column_stack([xs, ys]).astype(np.float32)]
+
+
+def loop_strokes(rng: np.random.Generator) -> list[np.ndarray]:
+    cx = float(rng.uniform(95, 160))
+    cy = float(rng.uniform(90, 165))
+    rx = float(rng.uniform(45, 80))
+    ry = float(rng.uniform(35, 75))
+    angles = np.linspace(0, 2 * math.pi, 48)
+    points = np.column_stack([cx + rx * np.cos(angles), cy + ry * np.sin(angles)]).astype(np.float32)
+    points += rng.normal(0, 1.2, size=points.shape).astype(np.float32)
+    return [points]
+
+
+def intersecting_strokes(rng: np.random.Generator) -> list[np.ndarray]:
+    cx = float(rng.uniform(95, 160))
+    cy = float(rng.uniform(95, 160))
+    span = float(rng.uniform(70, 120))
+    return [
+        np.array([[cx - span, cy], [cx + span, cy]], dtype=np.float32),
+        np.array([[cx, cy - span], [cx, cy + span]], dtype=np.float32),
+        np.array([[cx - span * 0.75, cy - span * 0.75], [cx + span * 0.75, cy + span * 0.75]], dtype=np.float32),
+    ]
+
+
+def cat_like_strokes(rng: np.random.Generator) -> list[np.ndarray]:
+    x_shift = float(rng.uniform(-15, 15))
+    y_shift = float(rng.uniform(-10, 10))
+    left_body = arc_points((94 + x_shift, 148 + y_shift), 43, 110, 430, 34)
+    right_body = arc_points((158 + x_shift, 148 + y_shift), 45, 105, 430, 34)
+    left_ear = np.array([[75, 77], [88, 37], [104, 76]], dtype=np.float32) + [x_shift, y_shift]
+    right_ear = np.array([[142, 75], [156, 38], [175, 75]], dtype=np.float32) + [x_shift, y_shift]
+    ground = np.array([[20, 185], [232, 185]], dtype=np.float32) + [0, y_shift]
+    tail = arc_points((76 + x_shift, 196 + y_shift), 26, 270, 80, 24)
+    return [left_ear, left_body, right_ear, right_body, ground, tail]
+
+
+def synthetic_rich_samples(count: int = 240, seed: int = 7) -> list[QuickDrawSample]:
+    rng = np.random.default_rng(seed)
+    generators = [rectangle_strokes, triangle_strokes, zigzag_strokes, loop_strokes, intersecting_strokes, cat_like_strokes]
+    samples = synthetic_samples()
+    for index in range(count):
+        generator = generators[index % len(generators)]
+        strokes = generator(rng)
+        scale = float(rng.uniform(0.85, 1.08))
+        offset = np.array([rng.uniform(-8, 8), rng.uniform(-8, 8)], dtype=np.float32)
+        transformed = [np.clip((stroke - 128.0) * scale + 128.0 + offset, 0, 255).astype(np.float32) for stroke in strokes]
+        samples.append(QuickDrawSample(f"synthetic_rich_{index:05d}", "synthetic_rich", True, transformed))
+    return samples
+
+
+def write_training_pairs(
+    samples: Iterable[QuickDrawSample],
+    processed_dir: Path,
+    image_size: int,
+    preview_count: int = 8,
+    line_width: int = 3,
+    node_radius: int = 3,
+    corner_angle_threshold_deg: float = 135.0,
+    corner_stride: int = 2,
+) -> dict:
     image_dir = processed_dir / "images"
     mask_dir = processed_dir / "masks"
     preview_dir = processed_dir / "previews"
@@ -239,7 +338,14 @@ def write_training_pairs(samples: Iterable[QuickDrawSample], processed_dir: Path
 
     records = []
     for index, sample in enumerate(samples):
-        image, mask = render_training_pair(sample, image_size=image_size)
+        image, mask = render_training_pair(
+            sample,
+            image_size=image_size,
+            line_width=line_width,
+            node_radius=node_radius,
+            corner_angle_threshold_deg=corner_angle_threshold_deg,
+            corner_stride=corner_stride,
+        )
         stem = f"{index:06d}_{sample.category}_{sample.key_id}".replace(" ", "_")
         image_path = image_dir / f"{stem}.npy"
         mask_path = mask_dir / f"{stem}.npy"
@@ -257,6 +363,10 @@ def write_training_pairs(samples: Iterable[QuickDrawSample], processed_dir: Path
     manifest = {
         "schema": "quickdraw_stroke_pairs_v1",
         "image_size": image_size,
+        "line_width": line_width,
+        "node_radius": node_radius,
+        "corner_angle_threshold_deg": corner_angle_threshold_deg,
+        "corner_stride": corner_stride,
         "class_map": {"0": "background", "1": "line", "2": "node_corner"},
         "records": records,
     }
@@ -272,6 +382,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-drawings-per-category", type=int, default=100)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--synthetic-smoke", action="store_true")
+    parser.add_argument("--synthetic-rich", action="store_true")
+    parser.add_argument("--synthetic-count", type=int, default=240)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--line-width", type=int, default=3)
+    parser.add_argument("--node-radius", type=int, default=3)
+    parser.add_argument("--corner-angle-threshold", type=float, default=135.0)
+    parser.add_argument("--corner-stride", type=int, default=2)
     return parser
 
 
@@ -280,12 +397,21 @@ def main() -> None:
     processed_dir = Path(args.processed_dir)
     if args.synthetic_smoke:
         samples = synthetic_samples()
+    elif args.synthetic_rich:
+        samples = synthetic_rich_samples(count=args.synthetic_count, seed=args.seed)
     else:
         samples = iter_raw_samples(Path(args.raw_data_dir), args.categories, args.max_drawings_per_category)
-    manifest = write_training_pairs(samples, processed_dir, image_size=args.image_size)
+    manifest = write_training_pairs(
+        samples,
+        processed_dir,
+        image_size=args.image_size,
+        line_width=args.line_width,
+        node_radius=args.node_radius,
+        corner_angle_threshold_deg=args.corner_angle_threshold,
+        corner_stride=args.corner_stride,
+    )
     print(f"Wrote {len(manifest['records'])} training pairs to {processed_dir}")
 
 
 if __name__ == "__main__":
     main()
-

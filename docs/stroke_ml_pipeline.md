@@ -116,8 +116,67 @@ This writes:
 
 ```text
 models/stroke_unet_smoke.pt
-output/stroke_ml_debug/prediction_preview.png
+output/stroke_ml_debug/prediction_preview_00.png
 output/stroke_ml_debug/training_summary.json
+```
+
+## Stronger Local Training
+
+For a stronger no-download checkpoint, generate a richer procedural dataset and train with validation, augmentation, class weighting, and Dice loss:
+
+```bash
+python src/train_stroke_segmenter.py \
+  --synthetic-rich \
+  --synthetic-count 600 \
+  --processed-dir data/quickdraw/processed_rich \
+  --model-out models/stroke_unet_synthetic_rich.pt \
+  --best-model-out models/stroke_unet_synthetic_rich_best.pt \
+  --debug-dir output/stroke_ml_debug/rich_train \
+  --epochs 60 \
+  --batch-size 8 \
+  --image-size 128 \
+  --base-channels 24 \
+  --augment \
+  --validation-fraction 0.15 \
+  --node-radius 4 \
+  --line-width 3 \
+  --dice-loss-weight 0.5 \
+  --learning-rate 0.001 \
+  --cpu
+```
+
+This is still synthetic data, but it is much broader than the 3-sample smoke set. It creates rectangles, triangles, loops, intersections, zigzags, and simple cat-like curves so the model sees more line/corner cases before any QuickDraw data is downloaded.
+
+The trainer now writes:
+
+```text
+models/stroke_unet_synthetic_rich.pt
+models/stroke_unet_synthetic_rich_best.pt
+output/stroke_ml_debug/rich_train/training_summary.json
+output/stroke_ml_debug/rich_train/prediction_preview_*.png
+```
+
+Use the best checkpoint for inference first:
+
+```bash
+python src/stroke_based_pipeline.py \
+  --image input_images/square.png \
+  --output-dir output/stroke_based_ml_rich_square \
+  --segmentation-mode ml \
+  --model-path models/stroke_unet_synthetic_rich_best.pt
+```
+
+Or with the ML-only graph experiment:
+
+```bash
+python src/stroke_ml_graph_pipeline.py \
+  --image input_images/cats.jpg \
+  --model-path models/stroke_unet_synthetic_rich_best.pt \
+  --output-dir output/stroke_ml_graph_rich_cats \
+  --node-threshold 0.35 \
+  --line-threshold 0.35 \
+  --edge-score-threshold 0.18 \
+  --support-fraction-threshold 0.05
 ```
 
 ## Train From QuickDraw Data
@@ -130,10 +189,16 @@ python src/train_stroke_segmenter.py \
   --processed-dir data/quickdraw/processed \
   --categories cat flower bicycle \
   --max-drawings-per-category 100 \
-  --epochs 5 \
+  --regenerate-data \
+  --epochs 30 \
   --batch-size 8 \
   --image-size 128 \
-  --model-out models/stroke_unet_quickdraw.pt
+  --base-channels 24 \
+  --augment \
+  --node-radius 4 \
+  --dice-loss-weight 0.5 \
+  --model-out models/stroke_unet_quickdraw.pt \
+  --best-model-out models/stroke_unet_quickdraw_best.pt
 ```
 
 If `data/quickdraw/processed/manifest.json` is missing, the training script generates training pairs first.
