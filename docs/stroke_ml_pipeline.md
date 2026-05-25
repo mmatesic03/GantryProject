@@ -203,6 +203,52 @@ python src/train_stroke_segmenter.py \
 
 If `data/quickdraw/processed/manifest.json` is missing, the training script generates training pairs first.
 
+## QuickDraw Pilot Training
+
+Before committing to a long CPU Codespace run, use a smaller pilot. This should finish much sooner and is good for checking whether the model starts producing better masks:
+
+```bash
+python src/train_stroke_segmenter.py \
+  --raw-data-dir data/quickdraw/raw \
+  --processed-dir data/quickdraw/processed_quickdraw_pilot \
+  --categories cat dog rabbit bird horse \
+  --max-drawings-per-category 100 \
+  --regenerate-data \
+  --model-out models/stroke_unet_quickdraw_pilot.pt \
+  --best-model-out models/stroke_unet_quickdraw_pilot_best.pt \
+  --debug-dir output/stroke_ml_debug/quickdraw_pilot \
+  --epochs 8 \
+  --batch-size 8 \
+  --image-size 96 \
+  --base-channels 16 \
+  --augment \
+  --validation-fraction 0.15 \
+  --node-radius 3 \
+  --line-width 3 \
+  --dice-loss-weight 0.5 \
+  --learning-rate 0.001 \
+  --progress-every 5 \
+  --cpu
+```
+
+Then test the pilot checkpoint:
+
+```bash
+python src/stroke_based_pipeline.py \
+  --image input_images/cats.jpg \
+  --output-dir output/stroke_based_ml_pilot_cats \
+  --segmentation-mode ml \
+  --model-path models/stroke_unet_quickdraw_pilot_best.pt
+```
+
+If the pilot output is meaningfully better than the smoke checkpoint, scale up categories, samples, image size, base channels, and epochs.
+
+The trainer prints in-epoch progress:
+
+```text
+epoch 1/8 batch 5/54 running_loss=... elapsed=... eta=...
+```
+
 ## Run Stroke Inference With ML
 
 Use a real checkpoint:

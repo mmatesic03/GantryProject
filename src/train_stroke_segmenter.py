@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -276,6 +277,9 @@ def train(args: argparse.Namespace) -> dict:
     )
     if class_weights_tensor is not None:
         class_weights_tensor = class_weights_tensor.to(device)
+    print(f"device: {device}")
+    print(f"records: total={len(dataset)} train={len(train_dataset)} validation={len(val_dataset) if val_dataset is not None else 0}")
+    print(f"batches per epoch: {len(loader)}")
     print(f"class counts: {class_counts.tolist()}")
     print(f"class weights: {class_weights}")
     loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
@@ -288,7 +292,9 @@ def train(args: argparse.Namespace) -> dict:
         model.train()
         total_loss = 0.0
         part_totals: dict[str, float] = {}
-        for images, masks in loader:
+        epoch_started_at = time.time()
+        last_progress_at = epoch_started_at
+        for batch_index, (images, masks) in enumerate(loader, start=1):
             images = images.to(device)
             masks = masks.to(device)
             optimizer.zero_grad()
@@ -301,6 +307,22 @@ def train(args: argparse.Namespace) -> dict:
             total_loss += float(loss.item()) * images.shape[0]
             for key, value in parts.items():
                 part_totals[key] = part_totals.get(key, 0.0) + value * images.shape[0]
+            if args.progress_every > 0 and (batch_index == 1 or batch_index == len(loader) or batch_index % args.progress_every == 0):
+                now = time.time()
+                elapsed_s = now - epoch_started_at
+                batches_per_s = batch_index / max(elapsed_s, 1e-9)
+                remaining_batches = len(loader) - batch_index
+                eta_s = remaining_batches / max(batches_per_s, 1e-9)
+                running_loss = total_loss / max(batch_index * args.batch_size, 1)
+                if now - last_progress_at >= args.progress_min_interval_s or batch_index in {1, len(loader)}:
+                    print(
+                        f"epoch {epoch + 1}/{args.epochs} "
+                        f"batch {batch_index}/{len(loader)} "
+                        f"running_loss={running_loss:.4f} "
+                        f"elapsed={elapsed_s:.1f}s eta={eta_s:.1f}s",
+                        flush=True,
+                    )
+                    last_progress_at = now
         epoch_loss = total_loss / len(train_dataset)
         entry = {
             "epoch": epoch + 1,
@@ -404,6 +426,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--augment", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--progress-every", type=int, default=10, help="Print training progress every N batches. Use 0 to disable.")
+    parser.add_argument("--progress-min-interval-s", type=float, default=5.0, help="Minimum seconds between repeated progress prints.")
     parser.add_argument("--no-class-weights", action="store_true", help="Disable foreground-aware class weighting.")
     parser.add_argument("--max-class-weight", type=float, default=20.0, help="Clamp inverse-frequency class weights.")
     parser.add_argument("--dice-loss-weight", type=float, default=0.5)
