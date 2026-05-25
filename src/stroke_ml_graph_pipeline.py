@@ -15,6 +15,7 @@ No skeletonisation is used in this ML-only graph pipeline.
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
 from dataclasses import dataclass
@@ -78,6 +79,13 @@ class MLGraphEdge:
     accepted: bool
     reason: str
     polyline_px: np.ndarray
+    straight_polyline_px: np.ndarray
+    path_length_px: float
+    path_length_ratio: float
+    min_line_probability: float
+    total_path_cost: float
+    search_mode: str
+    accepted_before_pruning: bool
 
 
 @dataclass
@@ -89,6 +97,9 @@ class MLGraphResult:
     raw_strokes_px: list[np.ndarray]
     node_mask: np.ndarray
     line_mask: np.ndarray
+    accepted_edges_before_pruning: list[MLGraphEdge]
+    rejected_by_path_score_count: int
+    rejected_by_degree_pruning_count: int
 
 
 def load_torch_probabilities(image_path: Path, model_path: Path) -> MLProbabilities:
@@ -303,17 +314,210 @@ def edge_probability_samples(
     return np.asarray(samples, dtype=np.float32), centerline
 
 
+def path_length(polyline: np.ndarray) -> float:
+    if len(polyline) < 2:
+        return 0.0
+    deltas = np.diff(polyline.astype(np.float32), axis=0)
+    return float(np.sum(np.linalg.norm(deltas, axis=1)))
+
+
+def line_path_cost(probability: float) -> float:
+    return 0.05 + (1.0 - float(probability)) ** 2
+
+
+def astar_probability_path(
+    line_prob: np.ndarray,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    margin_px: int,
+    max_path_to_straight_ratio: float,
+    max_expanded_nodes: int,
+) -> tuple[np.ndarray, float, bool]:
+    height, width = line_prob.shape
+    start_x = int(round(p0[0]))
+    start_y = int(round(p0[1]))
+    goal_x = int(round(p1[0]))
+    goal_y = int(round(p1[1]))
+    if not (0 <= start_x < width and 0 <= start_y < height and 0 <= goal_x < width and 0 <= goal_y < height):
+        return sample_edge_polyline(p0, p1, step_px=1.0), float("inf"), False
+
+    straight = math.hypot(goal_x - start_x, goal_y - start_y)
+    if straight <= 1e-9:
+        return np.array([[start_x, start_y]], dtype=np.float32), 0.0, True
+
+    min_x = max(0, min(start_x, goal_x) - margin_px)
+    max_x = min(width - 1, max(start_x, goal_x) + margin_px)
+    min_y = max(0, min(start_y, goal_y) - margin_px)
+    max_y = min(height - 1, max(start_y, goal_y) + margin_px)
+    max_allowed_cost = straight * max_path_to_straight_ratio * 1.75
+
+    def heuristic(x: int, y: int) -> float:
+        return 0.05 * math.hypot(goal_x - x, goal_y - y)
+
+    start = (start_y, start_x)
+    goal = (goal_y, goal_x)
+    queue: list[tuple[float, float, tuple[int, int]]] = [(heuristic(start_x, start_y), 0.0, start)]
+    best_cost: dict[tuple[int, int], float] = {start: 0.0}
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    directions = [
+        (-1, 0, 1.0),
+        (1, 0, 1.0),
+        (0, -1, 1.0),
+        (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)),
+        (-1, 1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)),
+        (1, 1, math.sqrt(2.0)),
+    ]
+
+    found = False
+    final_cost = float("inf")
+    expanded_nodes = 0
+    while queue:
+        _, cost, current = heapq.heappop(queue)
+        if cost != best_cost.get(current, float("inf")):
+            continue
+        expanded_nodes += 1
+        if expanded_nodes > max_expanded_nodes:
+            break
+        if current == goal:
+            found = True
+            final_cost = cost
+            break
+        if cost > max_allowed_cost:
+            continue
+        cy, cx = current
+        for dy, dx, step_distance in directions:
+            ny = cy + dy
+            nx = cx + dx
+            if nx < min_x or nx > max_x or ny < min_y or ny > max_y:
+                continue
+            move_cost = line_path_cost(float(line_prob[ny, nx])) * step_distance
+            new_cost = cost + move_cost
+            if new_cost < best_cost.get((ny, nx), float("inf")):
+                best_cost[(ny, nx)] = new_cost
+                parent[(ny, nx)] = current
+                heapq.heappush(queue, (new_cost + heuristic(nx, ny), new_cost, (ny, nx)))
+
+    if not found:
+        return sample_edge_polyline(p0, p1, step_px=1.0), float("inf"), False
+
+    path_yx = [goal]
+    current = goal
+    while current != start:
+        current = parent[current]
+        path_yx.append(current)
+    path_yx.reverse()
+    path_xy = np.array([[float(x), float(y)] for y, x in path_yx], dtype=np.float32)
+    return path_xy, final_cost, True
+
+
+def score_edge_path(
+    line_prob: np.ndarray,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    args: argparse.Namespace,
+) -> dict:
+    straight_polyline = sample_edge_polyline(p0, p1, step_px=args.densify_step_px)
+    straight_samples, _ = edge_probability_samples(
+        line_prob,
+        p0,
+        p1,
+        corridor_radius_px=args.edge_corridor_radius_px,
+        step_px=args.densify_step_px,
+    )
+    straight_distance = float(math.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+    straight_score = 0.0
+    if len(straight_samples) > 0:
+        straight_support = float(np.count_nonzero(straight_samples >= args.line_threshold) / len(straight_samples))
+        straight_score = 0.65 * float(np.mean(straight_samples)) + 0.35 * straight_support
+
+    use_path = args.edge_search_mode in {"path", "hybrid"}
+    path_found = False
+    total_path_cost = float("inf")
+    if use_path:
+        path_polyline, total_path_cost, path_found = astar_probability_path(
+            line_prob,
+            p0,
+            p1,
+            margin_px=args.path_corridor_margin_px,
+            max_path_to_straight_ratio=args.max_path_to_straight_ratio,
+            max_expanded_nodes=args.path_max_expanded_nodes,
+        )
+    else:
+        path_polyline = straight_polyline
+        total_path_cost = straight_distance
+        path_found = True
+
+    if args.edge_search_mode == "hybrid" and (not path_found):
+        path_polyline = straight_polyline
+        total_path_cost = straight_distance
+        path_found = True
+
+    pixels = np.rint(path_polyline).astype(np.int32)
+    pixels[:, 0] = np.clip(pixels[:, 0], 0, line_prob.shape[1] - 1)
+    pixels[:, 1] = np.clip(pixels[:, 1], 0, line_prob.shape[0] - 1)
+    values = line_prob[pixels[:, 1], pixels[:, 0]].astype(np.float32)
+    mean_prob = float(np.mean(values)) if len(values) else 0.0
+    max_prob = float(np.max(values)) if len(values) else 0.0
+    min_prob = float(np.min(values)) if len(values) else 0.0
+    support_fraction = float(np.count_nonzero(values >= args.line_threshold) / max(len(values), 1))
+    length_px = path_length(path_polyline)
+    length_ratio = length_px / max(straight_distance, 1e-6)
+    path_score = 0.55 * mean_prob + 0.45 * support_fraction
+    if args.edge_search_mode == "hybrid":
+        score = max(path_score, straight_score)
+    elif args.edge_search_mode == "straight":
+        score = straight_score
+    else:
+        score = path_score
+
+    return {
+        "polyline": path_polyline,
+        "straight_polyline": straight_polyline,
+        "mean_prob": mean_prob,
+        "max_prob": max_prob,
+        "min_prob": min_prob,
+        "support_fraction": support_fraction,
+        "score": float(score),
+        "length_px": length_px,
+        "length_ratio": length_ratio,
+        "total_path_cost": float(total_path_cost),
+        "path_found": path_found or args.edge_search_mode == "straight",
+    }
+
+
+def prune_edges_by_degree(edges: list[MLGraphEdge], vertices: list[MLGraphVertex], max_degree: int) -> tuple[list[MLGraphEdge], int]:
+    if max_degree <= 0:
+        for i, edge in enumerate(edges):
+            edge.id = i
+            edge.accepted = True
+            edge.reason = "accepted"
+        return edges, 0
+
+    degree = {vertex.id: 0 for vertex in vertices}
+    accepted: list[MLGraphEdge] = []
+    rejected = 0
+    for edge in sorted(edges, key=lambda item: (item.score, item.support_fraction, -item.distance_px), reverse=True):
+        if degree.get(edge.u, 0) >= max_degree or degree.get(edge.v, 0) >= max_degree:
+            edge.accepted = False
+            edge.reason = "rejected by degree pruning"
+            rejected += 1
+            continue
+        degree[edge.u] = degree.get(edge.u, 0) + 1
+        degree[edge.v] = degree.get(edge.v, 0) + 1
+        edge.accepted = True
+        edge.reason = "accepted"
+        edge.id = len(accepted)
+        accepted.append(edge)
+    return accepted, rejected
+
+
 def build_candidate_edges(
     vertices: list[MLGraphVertex],
     line_prob: np.ndarray,
-    max_distance_px: float,
-    nearest_neighbors: int,
-    edge_score_threshold: float,
-    line_threshold: float,
-    support_fraction_threshold: float,
-    corridor_radius_px: int,
-    densify_step_px: float,
-) -> tuple[list[MLGraphEdge], list[MLGraphEdge]]:
+    args: argparse.Namespace,
+) -> tuple[list[MLGraphEdge], list[MLGraphEdge], list[MLGraphEdge], int, int]:
     pairs: set[tuple[int, int]] = set()
     coords = np.array([[vertex.x, vertex.y] for vertex in vertices], dtype=np.float32)
     for i, vertex in enumerate(vertices):
@@ -327,54 +531,62 @@ def build_candidate_edges(
             if j == i:
                 continue
             distance = float(distances[j])
-            if distance > max_distance_px:
+            if distance > args.max_edge_distance_px:
                 continue
             pairs.add((min(i, j), max(i, j)))
             added += 1
-            if added >= nearest_neighbors:
+            if added >= args.nearest_neighbors:
                 break
 
     candidate_edges: list[MLGraphEdge] = []
-    accepted_edges: list[MLGraphEdge] = []
+    accepted_before_pruning: list[MLGraphEdge] = []
+    rejected_by_path_score = 0
     for u, v in sorted(pairs):
         p0 = (vertices[u].x, vertices[u].y)
         p1 = (vertices[v].x, vertices[v].y)
-        samples, polyline = edge_probability_samples(
-            line_prob,
-            p0,
-            p1,
-            corridor_radius_px=corridor_radius_px,
-            step_px=densify_step_px,
+        path_metrics = score_edge_path(line_prob, p0, p1, args)
+        accepted = bool(
+            path_metrics["path_found"]
+            and path_metrics["score"] >= args.edge_score_threshold
+            and path_metrics["support_fraction"] >= args.path_min_support_fraction
+            and path_metrics["support_fraction"] >= args.support_fraction_threshold
+            and path_metrics["length_ratio"] <= args.max_path_to_straight_ratio
+            and path_metrics["total_path_cost"] <= args.path_cost_threshold
         )
-        if len(samples) == 0:
-            mean_prob = 0.0
-            max_prob = 0.0
-            support_fraction = 0.0
-        else:
-            mean_prob = float(np.mean(samples))
-            max_prob = float(np.max(samples))
-            support_fraction = float(np.count_nonzero(samples >= line_threshold) / len(samples))
-        score = 0.65 * mean_prob + 0.35 * support_fraction
-        accepted = bool(score >= edge_score_threshold and support_fraction >= support_fraction_threshold)
         reason = "accepted" if accepted else "score/support below threshold"
+        if not path_metrics["path_found"]:
+            reason = "no low-cost probability path found"
+        elif path_metrics["length_ratio"] > args.max_path_to_straight_ratio:
+            reason = "path too long relative to straight distance"
+        elif path_metrics["total_path_cost"] > args.path_cost_threshold:
+            reason = "path cost above threshold"
+        if not accepted:
+            rejected_by_path_score += 1
         edge = MLGraphEdge(
             id=len(candidate_edges),
             u=u,
             v=v,
             distance_px=float(math.hypot(p1[0] - p0[0], p1[1] - p0[1])),
-            mean_line_probability=mean_prob,
-            max_line_probability=max_prob,
-            support_fraction=support_fraction,
-            score=score,
+            mean_line_probability=path_metrics["mean_prob"],
+            max_line_probability=path_metrics["max_prob"],
+            support_fraction=path_metrics["support_fraction"],
+            score=path_metrics["score"],
             accepted=accepted,
             reason=reason,
-            polyline_px=polyline,
+            polyline_px=path_metrics["polyline"],
+            straight_polyline_px=path_metrics["straight_polyline"],
+            path_length_px=path_metrics["length_px"],
+            path_length_ratio=path_metrics["length_ratio"],
+            min_line_probability=path_metrics["min_prob"],
+            total_path_cost=path_metrics["total_path_cost"],
+            search_mode=args.edge_search_mode,
+            accepted_before_pruning=accepted,
         )
         candidate_edges.append(edge)
         if accepted:
-            edge.id = len(accepted_edges)
-            accepted_edges.append(edge)
-    return candidate_edges, accepted_edges
+            accepted_before_pruning.append(edge)
+    accepted_edges, rejected_by_degree = prune_edges_by_degree(accepted_before_pruning, vertices, args.max_degree)
+    return candidate_edges, accepted_before_pruning, accepted_edges, rejected_by_path_score, rejected_by_degree
 
 
 def orient_edge(edge: MLGraphEdge, from_vertex: int) -> np.ndarray:
@@ -408,15 +620,38 @@ def extract_recursive_strokes(vertices: list[MLGraphVertex], edges: list[MLGraph
 
         current = start
         stroke_parts: list[np.ndarray] = []
+        previous_direction: np.ndarray | None = None
         while True:
             available = list(adjacency.get(current, set()) & unused)
             if not available:
                 break
-            available.sort(key=lambda edge_id: edge_by_id[edge_id].score, reverse=True)
+            if previous_direction is None:
+                available.sort(key=lambda edge_id: edge_by_id[edge_id].score, reverse=True)
+            else:
+                scored_edges = []
+                for edge_id in available:
+                    candidate = orient_edge(edge_by_id[edge_id], current)
+                    if len(candidate) < 2:
+                        angle_score = -1.0
+                    else:
+                        direction = candidate[min(3, len(candidate) - 1)] - candidate[0]
+                        norm = float(np.linalg.norm(direction))
+                        if norm <= 1e-9:
+                            angle_score = -1.0
+                        else:
+                            unit = direction / norm
+                            angle_score = float(np.dot(previous_direction, unit))
+                    scored_edges.append((angle_score, edge_by_id[edge_id].score, edge_id))
+                scored_edges.sort(reverse=True)
+                available = [edge_id for _, _, edge_id in scored_edges]
             edge = edge_by_id[available[0]]
             unused.remove(edge.id)
             oriented = orient_edge(edge, current)
             stroke_parts.append(oriented if not stroke_parts else oriented[1:])
+            if len(oriented) >= 2:
+                direction = oriented[-1] - oriented[max(0, len(oriented) - 4)]
+                norm = float(np.linalg.norm(direction))
+                previous_direction = direction / norm if norm > 1e-9 else previous_direction
             current = edge.v if current == edge.u else edge.u
         if stroke_parts:
             stroke = np.vstack(stroke_parts)
@@ -436,16 +671,10 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         max_vertices=args.max_vertices,
     )
     line_mask = probabilities.line_prob >= args.line_threshold
-    candidate_edges, accepted_edges = build_candidate_edges(
+    candidate_edges, accepted_before_pruning, accepted_edges, rejected_by_path_score, rejected_by_degree = build_candidate_edges(
         vertices,
         probabilities.line_prob,
-        max_distance_px=args.max_edge_distance_px,
-        nearest_neighbors=args.nearest_neighbors,
-        edge_score_threshold=args.edge_score_threshold,
-        line_threshold=args.line_threshold,
-        support_fraction_threshold=args.support_fraction_threshold,
-        corridor_radius_px=args.edge_corridor_radius_px,
-        densify_step_px=args.densify_step_px,
+        args,
     )
     strokes = extract_recursive_strokes(vertices, accepted_edges)
     return MLGraphResult(
@@ -456,6 +685,9 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         raw_strokes_px=[stroke.copy() for stroke in strokes],
         node_mask=node_mask,
         line_mask=line_mask,
+        accepted_edges_before_pruning=accepted_before_pruning,
+        rejected_by_path_score_count=rejected_by_path_score,
+        rejected_by_degree_pruning_count=rejected_by_degree,
     )
 
 
@@ -528,8 +760,16 @@ def compute_metrics(
     servo_sweep_ms = abs(firmware_constants["PEN_UP_ANGLE"] - firmware_constants["PEN_DOWN_ANGLE"]) * firmware_constants["SERVO_DELAY_MS"]
     pen_change_time_s = mode_changes * (firmware_constants["PEN_SETTLE_MS"] + servo_sweep_ms) / 1000.0
     edge_scores = [edge.score for edge in graph.accepted_edges]
+    pre_prune_scores = [edge.score for edge in graph.accepted_edges_before_pruning]
     candidate_scores = [edge.score for edge in graph.candidate_edges]
+    path_ratios = [edge.path_length_ratio for edge in graph.accepted_edges if math.isfinite(edge.path_length_ratio)]
+    candidate_path_ratios = [edge.path_length_ratio for edge in graph.candidate_edges if math.isfinite(edge.path_length_ratio)]
     stroke_point_counts = [len(stroke) for stroke in graph.strokes_px]
+    vertex_degree = {vertex.id: 0 for vertex in graph.vertices}
+    for edge in graph.accepted_edges:
+        vertex_degree[edge.u] = vertex_degree.get(edge.u, 0) + 1
+        vertex_degree[edge.v] = vertex_degree.get(edge.v, 0) + 1
+    degree_values = list(vertex_degree.values())
     warnings = []
     if not graph.vertices:
         warnings.append("No ML node/corner components became graph vertices.")
@@ -539,6 +779,10 @@ def compute_metrics(
         warnings.append("Accepted edge count is low relative to vertex count; edge thresholds may be too strict or line probabilities too weak.")
     if np.count_nonzero(graph.node_mask) > np.count_nonzero(graph.line_mask) * 2:
         warnings.append("Node/corner mask is much denser than line mask; the checkpoint may over-predict node/corner.")
+    if degree_values and max(degree_values) > args.max_degree:
+        warnings.append("Graph remains over-connected after pruning; max vertex degree exceeds configured max_degree.")
+    if graph.accepted_edges_before_pruning and len(graph.accepted_edges) / len(graph.accepted_edges_before_pruning) < 0.35:
+        warnings.append("Degree pruning removed most initially accepted edges; candidate graph was over-connected.")
 
     return {
         "schema": "stroke_ml_graph_metrics_v1",
@@ -567,14 +811,28 @@ def compute_metrics(
             "vertex_count": len(graph.vertices),
             "node_component_vertex_count": len(graph.vertices),
             "candidate_edge_count": len(graph.candidate_edges),
+            "candidate_edge_count_before_pruning": len(graph.candidate_edges),
             "accepted_edge_count": len(graph.accepted_edges),
+            "accepted_edge_count_before_pruning": len(graph.accepted_edges_before_pruning),
+            "accepted_edge_count_after_pruning": len(graph.accepted_edges),
             "rejected_edge_count": len(graph.candidate_edges) - len(graph.accepted_edges),
+            "rejected_by_path_score_count": graph.rejected_by_path_score_count,
+            "rejected_by_degree_pruning_count": graph.rejected_by_degree_pruning_count,
             "node_mask_pixel_count": int(np.count_nonzero(graph.node_mask)),
             "line_mask_pixel_count": int(np.count_nonzero(graph.line_mask)),
             "line_to_node_pixel_ratio": float(np.count_nonzero(graph.line_mask) / max(np.count_nonzero(graph.node_mask), 1)),
             "edge_score_mean": float(np.mean(edge_scores)) if edge_scores else 0.0,
             "edge_score_max": float(np.max(edge_scores)) if edge_scores else 0.0,
+            "path_score_mean": float(np.mean(edge_scores)) if edge_scores else 0.0,
+            "path_score_max": float(np.max(edge_scores)) if edge_scores else 0.0,
+            "pre_prune_path_score_mean": float(np.mean(pre_prune_scores)) if pre_prune_scores else 0.0,
             "candidate_edge_score_mean": float(np.mean(candidate_scores)) if candidate_scores else 0.0,
+            "path_length_ratio_mean": float(np.mean(path_ratios)) if path_ratios else 0.0,
+            "path_length_ratio_max": float(np.max(path_ratios)) if path_ratios else 0.0,
+            "candidate_path_length_ratio_mean": float(np.mean(candidate_path_ratios)) if candidate_path_ratios else 0.0,
+            "average_vertex_degree": float(np.mean(degree_values)) if degree_values else 0.0,
+            "max_vertex_degree": int(max(degree_values)) if degree_values else 0,
+            "vertex_degrees": {str(key): int(value) for key, value in vertex_degree.items()},
             "stroke_point_counts": [int(count) for count in stroke_point_counts],
         },
         "thresholds": {
@@ -582,9 +840,16 @@ def compute_metrics(
             "line_threshold": args.line_threshold,
             "edge_score_threshold": args.edge_score_threshold,
             "support_fraction_threshold": args.support_fraction_threshold,
+            "path_min_support_fraction": args.path_min_support_fraction,
             "max_edge_distance_px": args.max_edge_distance_px,
             "nearest_neighbors": args.nearest_neighbors,
             "edge_corridor_radius_px": args.edge_corridor_radius_px,
+            "edge_search_mode": args.edge_search_mode,
+            "max_degree": args.max_degree,
+            "path_corridor_margin_px": args.path_corridor_margin_px,
+            "max_path_to_straight_ratio": args.max_path_to_straight_ratio,
+            "path_cost_threshold": args.path_cost_threshold,
+            "path_max_expanded_nodes": args.path_max_expanded_nodes,
         },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
@@ -656,15 +921,22 @@ def save_edge_debug(probabilities: MLProbabilities, graph: MLGraphResult, output
     image = Image.fromarray(probabilities.gray, mode="L").convert("RGB")
     overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
+    degree = {vertex.id: 0 for vertex in graph.vertices}
+    for edge in graph.accepted_edges:
+        degree[edge.u] = degree.get(edge.u, 0) + 1
+        degree[edge.v] = degree.get(edge.v, 0) + 1
     for edge in graph.candidate_edges:
         points = [(float(x), float(y)) for x, y in edge.polyline_px]
-        color = (30, 150, 90, 220) if edge.accepted else (220, 60, 60, 90)
+        straight_points = [(float(x), float(y)) for x, y in edge.straight_polyline_px]
+        if len(straight_points) >= 2 and edge.search_mode in {"path", "hybrid"}:
+            draw.line(straight_points, fill=(80, 80, 80, 45), width=1)
+        color = (30, 150, 90, 230) if edge.accepted else (220, 60, 60, 80)
         width = 2 if edge.accepted else 1
         if len(points) >= 2:
             draw.line(points, fill=color, width=width)
     for vertex in graph.vertices:
         draw.ellipse((vertex.x - 4, vertex.y - 4, vertex.x + 4, vertex.y + 4), fill=(255, 230, 0, 235), outline=(0, 0, 0, 235))
-        draw.text((vertex.x + 5, vertex.y + 3), str(vertex.id), fill=(0, 0, 0, 255))
+        draw.text((vertex.x + 5, vertex.y + 3), f"{vertex.id}/{degree.get(vertex.id, 0)}", fill=(0, 0, 0, 255))
     Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
 
 
@@ -729,7 +1001,10 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     print(f"Model path: {model_path}")
     print("Segmentation mode used: ML graph no skeleton")
     print(f"Vertices: {len(graph.vertices)}")
-    print(f"Candidate/accepted edges: {len(graph.candidate_edges)} / {len(graph.accepted_edges)}")
+    print(
+        "Candidate/pre-prune/post-prune edges: "
+        f"{len(graph.candidate_edges)} / {len(graph.accepted_edges_before_pruning)} / {len(graph.accepted_edges)}"
+    )
     print(f"Strokes: {metrics['stroke_count']}")
     print(f"Commands: {metrics['command_count']}")
     print(f"Bounds valid: {metrics['bounds_validation_passed']}")
@@ -749,6 +1024,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--line-threshold", type=float, default=0.35)
     parser.add_argument("--edge-score-threshold", type=float, default=0.25)
     parser.add_argument("--support-fraction-threshold", type=float, default=0.20)
+    parser.add_argument("--edge-search-mode", choices=["straight", "path", "hybrid"], default="path")
+    parser.add_argument("--max-degree", type=int, default=3)
+    parser.add_argument("--path-corridor-margin-px", type=int, default=24)
+    parser.add_argument("--max-path-to-straight-ratio", type=float, default=2.5)
+    parser.add_argument("--path-min-support-fraction", type=float, default=0.35)
+    parser.add_argument("--path-cost-threshold", type=float, default=1000000000.0)
+    parser.add_argument("--path-max-expanded-nodes", type=int, default=8000)
     parser.add_argument("--max-edge-distance-px", type=float, default=180.0)
     parser.add_argument("--nearest-neighbors", type=int, default=8)
     parser.add_argument("--edge-corridor-radius-px", type=int, default=2)
