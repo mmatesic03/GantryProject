@@ -201,6 +201,69 @@ Useful reconstruction tuning flags:
 --min-edge-new-coverage-fraction 0.30
 ```
 
+## Tune ML Graph Parameters
+
+Manual tuning is slow because the best reconstruction settings depend on the
+image, model checkpoint, and how dense the node/corner channel is. The tuning
+script runs ML inference once, sweeps graph reconstruction parameters, renders
+each stroke result back into image space, compares it with a target line mask,
+and ranks the candidates.
+
+Example:
+
+```bash
+python src/tune_ml_graph_parameters.py \
+  --image input_images/cats.jpg \
+  --model-path models/stroke_unet_quickdraw_pilot_best.pt \
+  --output-dir output/ml_graph_tuning_cats \
+  --target-source grayscale \
+  --max-runs 80 \
+  --top-k 5
+```
+
+For a tiny smoke test:
+
+```bash
+python src/tune_ml_graph_parameters.py \
+  --image input_images/square.png \
+  --model-path models/stroke_unet_quickdraw_pilot_best.pt \
+  --output-dir output/ml_graph_tuning_square_smoke \
+  --target-source grayscale \
+  --max-runs 3 \
+  --top-k 2
+```
+
+Grid values are comma-separated:
+
+```bash
+--node-thresholds 0.30,0.35,0.40 \
+--line-thresholds 0.30,0.35,0.40 \
+--edge-score-thresholds 0.14,0.18,0.22 \
+--vertex-passthrough-radii 8,10,14 \
+--line-anchor-distances 16,20,28 \
+--max-line-anchors 4,8 \
+--component-vertex-radii 14,18,24 \
+--min-new-coverage-fractions 0.20,0.30,0.40 \
+--max-degrees 2,3
+```
+
+Outputs include:
+
+- `tuning_results.json` and `tuning_results.csv`: ranked parameter sets and scores.
+- `best_params.json`: best settings, score terms, and summary metrics.
+- `best_arduino_commands.txt`: Arduino serial commands for the best run.
+- `best_gantry_path_preview.png`: best gantry-space preview.
+- `best_stroke_sequence_debug.png`: best image-space stroke sequence.
+- `best_mask_comparison.png` and `top_###_preview.png`: blue target mask with red rendered strokes.
+- `target_mask.png`: the comparison target used by the scorer.
+
+The score rewards target line coverage, low false-positive drawing, low
+Chamfer-like line distance, graph line coverage, and valid bounds. It penalizes
+excessive command count, pen-up travel, stroke count, suspicious long/low-support
+edges, and invalid bounds. A top-ranked result is an empirical reconstruction
+setting for the current model and image; it is not proof that the ML model is
+perfect.
+
 ## Train From QuickDraw Data
 
 After placing selected `.ndjson` files under `data/quickdraw/raw/`, train with:
