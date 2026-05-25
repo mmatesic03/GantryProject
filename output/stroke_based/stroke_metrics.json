@@ -1,18 +1,22 @@
 {
   "schema": "stroke_pipeline_metrics_v1",
-  "command_count": 8,
+  "command_count": 9,
   "stroke_count": 1,
-  "average_points_per_stroke": 8.0,
-  "median_points_per_stroke": 8.0,
+  "average_points_per_stroke": 9.0,
+  "median_points_per_stroke": 9.0,
   "two_point_stroke_count": 0,
   "two_point_stroke_fraction": 0.0,
-  "pen_down_drawing_distance_mm": 449.80311309397104,
+  "closed_loop_stroke_count": 1,
+  "raw_points_total_before_simplification": 1366,
+  "points_total_after_simplification": 9,
+  "average_raw_points_per_stroke": 1366.0,
+  "pen_down_drawing_distance_mm": 450.7304662496255,
   "pen_up_travel_distance_mm": 0.0,
-  "total_movement_distance_mm": 449.80311309397104,
-  "estimated_draw_movement_time_s": 32.71295367956153,
+  "total_movement_distance_mm": 450.7304662496255,
+  "estimated_draw_movement_time_s": 32.78039754542731,
   "estimated_travel_movement_time_s": 0.0,
   "estimated_pen_mode_change_settle_time_s": 2.45,
-  "estimated_total_plotting_time_s": 35.16295367956153,
+  "estimated_total_plotting_time_s": 35.230397545427316,
   "mode_change_count": 2,
   "command_bounds_mm": {
     "min_x_mm": 18.770491803278688,
@@ -34,12 +38,20 @@
     "edge_count": 4,
     "assembled_stroke_count": 1,
     "stroke_point_counts": [
-      8
+      9
     ],
+    "raw_stroke_point_counts": [
+      1366
+    ],
+    "skeleton_connected_component_count": 1,
     "skeleton_pixel_count": 1380,
     "endpoint_count": 0,
     "junction_pixel_count": 11,
-    "corner_pixel_count": 3
+    "junction_cluster_count": 4,
+    "accepted_corner_count": 3,
+    "rejected_corner_candidate_count": 0,
+    "corner_candidate_count": 3,
+    "corner_candidate_fraction_of_skeleton": 0.002173913043478261
   },
   "gantry_mapping": {
     "work_w_mm": 150.0,

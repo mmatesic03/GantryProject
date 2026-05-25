@@ -46,11 +46,14 @@ class SegmentationResult:
 class StrokeGraph:
     vertices: list[dict]
     edges: list[dict]
+    raw_strokes_px: list[np.ndarray]
     strokes_px: list[np.ndarray]
     endpoint_mask: np.ndarray
     junction_mask: np.ndarray
     corner_mask: np.ndarray
+    rejected_corner_mask: np.ndarray
     skeleton_mask: np.ndarray
+    skeleton_component_count: int
 
 
 class BaseSegmenter(ABC):
@@ -74,7 +77,7 @@ class HeuristicSegmenter(BaseSegmenter):
         line_mask = close_mask(line_mask, iterations=1)
         line_mask = remove_small_components(line_mask, self.min_component_area)
         skeleton = zhang_suen_thinning(line_mask)
-        endpoints, junctions, corners = detect_skeleton_nodes(skeleton)
+        endpoints, junctions, corners, _ = detect_skeleton_nodes(skeleton)
         node_mask = endpoints | junctions | corners
         return SegmentationResult(
             gray=gray,
@@ -223,7 +226,7 @@ def masks_from_model_probabilities(probs: np.ndarray, threshold: float) -> tuple
     else:
         line_mask = probs[0] >= threshold
         skeleton = zhang_suen_thinning(line_mask)
-        endpoints, junctions, corners = detect_skeleton_nodes(skeleton)
+        endpoints, junctions, corners, _ = detect_skeleton_nodes(skeleton)
         node_mask = endpoints | junctions | corners
     return line_mask, node_mask
 
@@ -381,19 +384,102 @@ def neighbor_count(mask: np.ndarray) -> np.ndarray:
     return count
 
 
-def detect_skeleton_nodes(skeleton: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def local_branch_direction(
+    skeleton: np.ndarray,
+    start: Pixel,
+    previous: Pixel,
+    max_steps: int,
+) -> np.ndarray | None:
+    current = start
+    last = previous
+    for _ in range(max_steps):
+        candidates = [pixel for pixel in pixel_neighbors(current, skeleton) if pixel != last]
+        if len(candidates) != 1:
+            break
+        last, current = current, candidates[0]
+
+    vector = np.array([current[1] - previous[1], current[0] - previous[0]], dtype=np.float64)
+    norm = np.linalg.norm(vector)
+    if norm < 1e-9:
+        return None
+    return vector / norm
+
+
+def detect_corner_candidates(
+    skeleton: np.ndarray,
+    degree: np.ndarray,
+    angle_threshold_deg: float,
+    lookahead: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    candidates = np.zeros_like(skeleton, dtype=bool)
+    scores = np.full(skeleton.shape, np.inf, dtype=np.float64)
+
+    ys, xs = np.nonzero(skeleton & (degree == 2))
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        pixel = (y, x)
+        neighbors = pixel_neighbors(pixel, skeleton)
+        if len(neighbors) != 2:
+            continue
+
+        d0 = local_branch_direction(skeleton, neighbors[0], pixel, lookahead)
+        d1 = local_branch_direction(skeleton, neighbors[1], pixel, lookahead)
+        if d0 is None or d1 is None:
+            continue
+
+        cosang = float(np.clip(np.dot(d0, d1), -1.0, 1.0))
+        angle = math.degrees(math.acos(cosang))
+        if angle <= angle_threshold_deg:
+            candidates[y, x] = True
+            scores[y, x] = angle
+
+    return candidates, scores
+
+
+def suppress_nearby_corners(
+    candidates: np.ndarray,
+    scores: np.ndarray,
+    min_separation_px: int,
+) -> np.ndarray:
+    accepted = np.zeros_like(candidates, dtype=bool)
+    candidate_points = np.argwhere(candidates)
+    if len(candidate_points) == 0:
+        return accepted
+
+    order = sorted(
+        [(float(scores[y, x]), int(y), int(x)) for y, x in candidate_points],
+        key=lambda item: item[0],
+    )
+    accepted_points: list[tuple[int, int]] = []
+    min_sep2 = float(min_separation_px * min_separation_px)
+    for _, y, x in order:
+        too_close = any((y - ay) ** 2 + (x - ax) ** 2 < min_sep2 for ay, ax in accepted_points)
+        if too_close:
+            continue
+        accepted[y, x] = True
+        accepted_points.append((y, x))
+
+    return accepted
+
+
+def detect_skeleton_nodes(
+    skeleton: np.ndarray,
+    corner_angle_threshold_deg: float = 100.0,
+    corner_min_separation_px: int = 12,
+    corner_lookahead_px: int = 8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     skeleton = skeleton.astype(bool)
     count = neighbor_count(skeleton)
     endpoints = skeleton & (count == 1)
     junctions = skeleton & (count >= 3)
-
-    neighbors = shifted_neighbors(skeleton)
-    opposite_pairs = [(0, 4), (1, 5), (2, 6), (3, 7)]
-    opposite = np.zeros_like(skeleton, dtype=bool)
-    for a, b in opposite_pairs:
-        opposite |= neighbors[a] & neighbors[b]
-    corners = skeleton & (count == 2) & ~opposite
-    return endpoints, junctions, corners
+    corner_candidates, corner_scores = detect_corner_candidates(
+        skeleton,
+        degree=count,
+        angle_threshold_deg=corner_angle_threshold_deg,
+        lookahead=corner_lookahead_px,
+    )
+    corners = suppress_nearby_corners(corner_candidates, corner_scores, corner_min_separation_px)
+    rejected_corners = corner_candidates & ~corners
+    return endpoints, junctions, corners, rejected_corners
 
 
 def cluster_vertices(node_mask: np.ndarray, skeleton: np.ndarray, radius: int = 1) -> tuple[list[dict], np.ndarray]:
@@ -529,6 +615,65 @@ def oriented_edge_path(edge: dict, from_vertex: int | None) -> tuple[np.ndarray,
     return path.copy(), end_vertex
 
 
+def unit_vector(vector: np.ndarray) -> np.ndarray | None:
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-9:
+        return None
+    return vector / norm
+
+
+def path_end_direction(path: np.ndarray) -> np.ndarray | None:
+    if len(path) < 2:
+        return None
+    for i in range(len(path) - 2, -1, -1):
+        vector = path[-1] - path[i]
+        direction = unit_vector(vector)
+        if direction is not None:
+            return direction
+    return None
+
+
+def path_start_direction(path: np.ndarray) -> np.ndarray | None:
+    if len(path) < 2:
+        return None
+    for i in range(1, len(path)):
+        vector = path[i] - path[0]
+        direction = unit_vector(vector)
+        if direction is not None:
+            return direction
+    return None
+
+
+def choose_smoothest_edge(
+    edges: list[dict],
+    candidate_edge_ids: list[int],
+    current_vertex: int,
+    incoming_direction: np.ndarray | None,
+    max_join_angle_deg: float,
+) -> int | None:
+    if not candidate_edge_ids:
+        return None
+    if incoming_direction is None:
+        return candidate_edge_ids[0]
+
+    best_edge_id = None
+    best_angle = float("inf")
+    for edge_id in candidate_edge_ids:
+        candidate_path, _ = oriented_edge_path(edges[edge_id], current_vertex)
+        candidate_direction = path_start_direction(candidate_path)
+        if candidate_direction is None:
+            continue
+        cosang = float(np.clip(np.dot(incoming_direction, candidate_direction), -1.0, 1.0))
+        angle = math.degrees(math.acos(cosang))
+        if angle < best_angle:
+            best_angle = angle
+            best_edge_id = edge_id
+
+    if best_edge_id is None or best_angle > max_join_angle_deg:
+        return None
+    return best_edge_id
+
+
 def append_path_without_duplicate(base: list[list[float]], path: np.ndarray) -> None:
     for point in path.tolist():
         if base and np.allclose(np.array(base[-1]), np.array(point)):
@@ -536,7 +681,11 @@ def append_path_without_duplicate(base: list[list[float]], path: np.ndarray) -> 
         base.append(point)
 
 
-def assemble_continuous_strokes(edges: list[dict], vertices: list[dict]) -> list[np.ndarray]:
+def assemble_continuous_strokes(
+    edges: list[dict],
+    vertices: list[dict],
+    junction_join_angle_deg: float = 35.0,
+) -> list[np.ndarray]:
     """
     Merge traced graph edges into longer drawable trails.
 
@@ -556,22 +705,34 @@ def assemble_continuous_strokes(edges: list[dict], vertices: list[dict]) -> list
         points: list[list[float]] = []
         current_vertex: int | None = start_vertex
         edge_id = first_edge_id
+        incoming_direction: np.ndarray | None = None
 
         while True:
             used_edges.add(edge_id)
             path, next_vertex = oriented_edge_path(edges[edge_id], current_vertex)
             append_path_without_duplicate(points, path)
+            incoming_direction = path_end_direction(path)
 
             if next_vertex is None:
-                break
-            if degrees.get(next_vertex, 0) != 2:
                 break
 
             candidates = [candidate for candidate in adjacency[next_vertex] if candidate not in used_edges]
             if not candidates:
                 break
+            if degrees.get(next_vertex, 0) == 2:
+                next_edge_id = candidates[0]
+            else:
+                next_edge_id = choose_smoothest_edge(
+                    edges,
+                    candidates,
+                    current_vertex=next_vertex,
+                    incoming_direction=incoming_direction,
+                    max_join_angle_deg=junction_join_angle_deg,
+                )
+                if next_edge_id is None:
+                    break
             current_vertex = next_vertex
-            edge_id = candidates[0]
+            edge_id = next_edge_id
 
         return np.array(points, dtype=np.float64)
 
@@ -615,7 +776,20 @@ def assemble_continuous_strokes(edges: list[dict], vertices: list[dict]) -> list
             ]
             if not candidates:
                 break
-            current_edge_id = candidates[0]
+            if len(candidates) == 1:
+                current_edge_id = candidates[0]
+            else:
+                incoming_direction = path_end_direction(path)
+                next_edge_id = choose_smoothest_edge(
+                    edges,
+                    candidates,
+                    current_vertex=current_vertex,
+                    incoming_direction=incoming_direction,
+                    max_join_angle_deg=junction_join_angle_deg,
+                )
+                if next_edge_id is None:
+                    break
+                current_edge_id = next_edge_id
 
         if len(points) >= 2:
             first = np.array(points[0])
@@ -640,30 +814,100 @@ def path_pixel_length(path: list[Pixel]) -> float:
     return total
 
 
-def build_stroke_graph(line_mask: np.ndarray, node_hint_mask: np.ndarray | None = None) -> StrokeGraph:
+def path_closed(path: np.ndarray, tolerance_px: float = 6.0) -> bool:
+    if len(path) < 3:
+        return False
+    return float(np.linalg.norm(path[0] - path[-1])) <= tolerance_px
+
+
+def simplify_stroke_preserving_loop(points: np.ndarray, epsilon: float) -> np.ndarray:
+    simplified = simplify_polyline(points, epsilon=epsilon)
+    if path_closed(points) and len(simplified) > 2 and not np.allclose(simplified[0], simplified[-1]):
+        simplified = np.vstack([simplified, simplified[0]])
+    return simplified
+
+
+def order_strokes_nearest_neighbor(strokes: list[np.ndarray]) -> list[np.ndarray]:
+    remaining = [stroke.copy() for stroke in strokes if len(stroke) >= 2]
+    if not remaining:
+        return []
+
+    ordered = [remaining.pop(0)]
+    while remaining:
+        current_end = ordered[-1][-1]
+        best_index = 0
+        best_reverse = False
+        best_distance = float("inf")
+        for i, stroke in enumerate(remaining):
+            distance_start = float(np.linalg.norm(current_end - stroke[0]))
+            distance_end = float(np.linalg.norm(current_end - stroke[-1]))
+            if distance_start < best_distance:
+                best_distance = distance_start
+                best_index = i
+                best_reverse = False
+            if distance_end < best_distance:
+                best_distance = distance_end
+                best_index = i
+                best_reverse = True
+
+        next_stroke = remaining.pop(best_index)
+        if best_reverse and not path_closed(next_stroke):
+            next_stroke = next_stroke[::-1].copy()
+        ordered.append(next_stroke)
+
+    return ordered
+
+
+def build_stroke_graph(
+    line_mask: np.ndarray,
+    node_hint_mask: np.ndarray | None = None,
+    split_corners: bool = False,
+    use_node_hints_as_vertices: bool = False,
+    corner_angle_threshold_deg: float = 100.0,
+    corner_min_separation_px: int = 12,
+    corner_lookahead_px: int = 8,
+    simplification_epsilon: float = 0.75,
+    junction_join_angle_deg: float = 35.0,
+) -> StrokeGraph:
     skeleton = zhang_suen_thinning(line_mask)
-    endpoints, junctions, corners = detect_skeleton_nodes(skeleton)
-    node_mask = endpoints | junctions | corners
-    if node_hint_mask is not None:
+    endpoints, junctions, corners, rejected_corners = detect_skeleton_nodes(
+        skeleton,
+        corner_angle_threshold_deg=corner_angle_threshold_deg,
+        corner_min_separation_px=corner_min_separation_px,
+        corner_lookahead_px=corner_lookahead_px,
+    )
+    node_mask = endpoints | junctions
+    if split_corners:
+        node_mask |= corners
+    if use_node_hints_as_vertices and node_hint_mask is not None:
         node_mask |= node_hint_mask.astype(bool) & skeleton
 
     vertices, label_map = cluster_vertices(node_mask, skeleton, radius=1)
     edges = trace_graph_edges(skeleton, label_map, vertices)
-    continuous_strokes = assemble_continuous_strokes(edges, vertices)
+    continuous_strokes = assemble_continuous_strokes(
+        edges,
+        vertices,
+        junction_join_angle_deg=junction_join_angle_deg,
+    )
+    raw_strokes = order_strokes_nearest_neighbor(continuous_strokes)
     strokes = [
-        simplify_polyline(stroke, epsilon=0.75)
+        simplify_stroke_preserving_loop(stroke, epsilon=simplification_epsilon)
         for stroke in continuous_strokes
         if len(stroke) >= 2
     ]
+    strokes = order_strokes_nearest_neighbor(strokes)
 
     return StrokeGraph(
         vertices=vertices,
         edges=edges,
+        raw_strokes_px=raw_strokes,
         strokes_px=strokes,
         endpoint_mask=endpoints,
         junction_mask=junctions,
         corner_mask=corners,
+        rejected_corner_mask=rejected_corners,
         skeleton_mask=skeleton,
+        skeleton_component_count=len(connected_components(skeleton, connectivity=8)),
     )
 
 
@@ -869,13 +1113,25 @@ def compute_command_metrics(
     pen_change_time_s = mode_changes * (firmware_constants["PEN_SETTLE_MS"] + servo_sweep_ms) / 1000.0
     total_time_s = (draw_time_s or 0.0) + (travel_time_s or 0.0) + pen_change_time_s
     stroke_point_counts = [int(len(stroke)) for stroke in graph.strokes_px]
+    raw_stroke_point_counts = [int(len(stroke)) for stroke in graph.raw_strokes_px]
     two_point_strokes = sum(1 for count in stroke_point_counts if count == 2)
     two_point_fraction = two_point_strokes / len(stroke_point_counts) if stroke_point_counts else 0.0
+    closed_loop_strokes = sum(1 for stroke in graph.strokes_px if path_closed(stroke))
+    skeleton_pixel_count = int(np.count_nonzero(graph.skeleton_mask))
+    accepted_corner_count = int(np.count_nonzero(graph.corner_mask))
+    rejected_corner_count = int(np.count_nonzero(graph.rejected_corner_mask))
+    corner_candidate_count = accepted_corner_count + rejected_corner_count
+    corner_candidate_fraction = corner_candidate_count / skeleton_pixel_count if skeleton_pixel_count else 0.0
     warnings = []
     if two_point_fraction > 0.5:
         warnings.append(
             "More than 50% of extracted strokes have only two points. "
             "Stroke extraction may still be too fragmented."
+        )
+    if corner_candidate_fraction > 0.15:
+        warnings.append(
+            "Corner candidate count is high relative to skeleton pixels. "
+            "Consider lowering corner sensitivity or keeping corners debug-only."
         )
 
     return {
@@ -886,6 +1142,10 @@ def compute_command_metrics(
         "median_points_per_stroke": float(np.median(stroke_point_counts)) if stroke_point_counts else 0.0,
         "two_point_stroke_count": two_point_strokes,
         "two_point_stroke_fraction": two_point_fraction,
+        "closed_loop_stroke_count": closed_loop_strokes,
+        "raw_points_total_before_simplification": int(sum(raw_stroke_point_counts)),
+        "points_total_after_simplification": int(sum(stroke_point_counts)),
+        "average_raw_points_per_stroke": float(np.mean(raw_stroke_point_counts)) if raw_stroke_point_counts else 0.0,
         "pen_down_drawing_distance_mm": draw_distance,
         "pen_up_travel_distance_mm": travel_distance,
         "total_movement_distance_mm": draw_distance + travel_distance,
@@ -906,10 +1166,16 @@ def compute_command_metrics(
             "edge_count": len(graph.edges),
             "assembled_stroke_count": len(graph.strokes_px),
             "stroke_point_counts": stroke_point_counts,
-            "skeleton_pixel_count": int(np.count_nonzero(graph.skeleton_mask)),
+            "raw_stroke_point_counts": raw_stroke_point_counts,
+            "skeleton_connected_component_count": graph.skeleton_component_count,
+            "skeleton_pixel_count": skeleton_pixel_count,
             "endpoint_count": int(np.count_nonzero(graph.endpoint_mask)),
             "junction_pixel_count": int(np.count_nonzero(graph.junction_mask)),
-            "corner_pixel_count": int(np.count_nonzero(graph.corner_mask)),
+            "junction_cluster_count": len(connected_components(graph.junction_mask, connectivity=8)),
+            "accepted_corner_count": accepted_corner_count,
+            "rejected_corner_candidate_count": rejected_corner_count,
+            "corner_candidate_count": corner_candidate_count,
+            "corner_candidate_fraction_of_skeleton": corner_candidate_fraction,
         },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
@@ -977,6 +1243,16 @@ def save_graph_debug(gray: np.ndarray, graph: StrokeGraph, output_path: Path) ->
         (131, 56, 236, 220),
         (0, 119, 182, 220),
     ]
+
+    for y, x in np.argwhere(graph.rejected_corner_mask):
+        draw.ellipse((x - 1, y - 1, x + 1, y + 1), fill=(255, 150, 0, 160))
+    for y, x in np.argwhere(graph.corner_mask):
+        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(160, 50, 220, 220), outline=(0, 0, 0, 220))
+    for y, x in np.argwhere(graph.junction_mask):
+        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=(220, 40, 40, 190))
+    for y, x in np.argwhere(graph.endpoint_mask):
+        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(0, 190, 70, 235), outline=(0, 0, 0, 235))
+
     for i, stroke in enumerate(graph.strokes_px):
         if len(stroke) < 2:
             continue
@@ -989,6 +1265,7 @@ def save_graph_debug(gray: np.ndarray, graph: StrokeGraph, output_path: Path) ->
         ex, ey = points[-1]
         draw.ellipse((sx - 4, sy - 4, sx + 4, sy + 4), fill=(0, 190, 70, 245), outline=(0, 0, 0, 245))
         draw.ellipse((ex - 3, ey - 3, ex + 3, ey + 3), fill=(40, 90, 255, 235), outline=(0, 0, 0, 235))
+        draw.text((sx + 5, sy + 5), str(i), fill=(0, 100, 0, 255))
         if is_fragment:
             mx = (sx + ex) / 2.0
             my = (sy + ey) / 2.0
@@ -998,6 +1275,40 @@ def save_graph_debug(gray: np.ndarray, graph: StrokeGraph, output_path: Path) ->
         y = float(vertex["y_px"])
         r = 3
         draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 230, 0, 235), outline=(0, 0, 0, 235))
+    Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
+
+
+def save_stroke_path_debug(
+    gray: np.ndarray,
+    strokes: list[np.ndarray],
+    output_path: Path,
+    title: str,
+) -> None:
+    image = Image.fromarray(gray, mode="L").convert("RGB")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    colors = [
+        (230, 57, 70, 225),
+        (42, 157, 143, 225),
+        (29, 53, 87, 225),
+        (244, 162, 97, 225),
+        (131, 56, 236, 225),
+        (0, 119, 182, 225),
+        (80, 150, 40, 225),
+    ]
+    for i, stroke in enumerate(strokes):
+        if len(stroke) < 2:
+            continue
+        points = [(float(x), float(y)) for x, y in stroke]
+        is_fragment = len(stroke) == 2
+        draw.line(points, fill=(255, 80, 0, 235) if is_fragment else colors[i % len(colors)], width=4 if is_fragment else 2)
+        sx, sy = points[0]
+        ex, ey = points[-1]
+        draw.ellipse((sx - 4, sy - 4, sx + 4, sy + 4), fill=(0, 190, 70, 245), outline=(0, 0, 0, 245))
+        draw.ellipse((ex - 3, ey - 3, ex + 3, ey + 3), fill=(40, 90, 255, 235), outline=(0, 0, 0, 235))
+        draw.text((sx + 5, sy + 5), str(i), fill=(0, 0, 0, 255))
+    draw.rectangle((0, 0, max(260, len(title) * 7), 18), fill=(255, 255, 255, 210))
+    draw.text((4, 3), title, fill=(20, 20, 20, 255))
     Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
 
 
@@ -1102,7 +1413,17 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         segmentation.mode_used = "ML attempted then fallback"
         segmentation.model_path_used = selected_model_path
 
-    graph = build_stroke_graph(segmentation.line_mask, segmentation.node_mask)
+    graph = build_stroke_graph(
+        segmentation.line_mask,
+        segmentation.node_mask,
+        split_corners=args.split_corners,
+        use_node_hints_as_vertices=args.use_segmentation_node_hints,
+        corner_angle_threshold_deg=args.corner_angle_threshold,
+        corner_min_separation_px=args.corner_min_separation,
+        corner_lookahead_px=args.corner_lookahead,
+        simplification_epsilon=args.simplification_epsilon,
+        junction_join_angle_deg=args.junction_join_angle,
+    )
     paths_mm, transform_info = map_paths_to_gantry_mm(
         graph.strokes_px,
         image_shape=segmentation.gray.shape,
@@ -1134,6 +1455,18 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     save_segmentation_debug(segmentation, output_dir / "segmentation_debug.png")
     save_skeleton_debug(graph, output_dir / "skeleton_debug.png")
     save_graph_debug(segmentation.gray, graph, output_dir / "graph_debug.png")
+    save_stroke_path_debug(
+        segmentation.gray,
+        graph.raw_strokes_px,
+        output_dir / "raw_traced_strokes_debug.png",
+        "Raw traced strokes before simplification",
+    )
+    save_stroke_path_debug(
+        segmentation.gray,
+        graph.strokes_px,
+        output_dir / "simplified_strokes_debug.png",
+        "Simplified strokes after graph assembly",
+    )
     save_gantry_preview(paths_mm, output_dir / "gantry_path_preview.png", args.work_width_mm, args.work_height_mm, args.margin_mm)
 
     print(f"Image: {image_path}")
@@ -1147,6 +1480,12 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     print(f"Average points/stroke: {metrics['average_points_per_stroke']:.2f}")
     print(f"Median points/stroke: {metrics['median_points_per_stroke']:.2f}")
     print(f"2-point strokes: {metrics['two_point_stroke_count']}")
+    print(f"Closed-loop strokes: {metrics['closed_loop_stroke_count']}")
+    print(
+        "Raw/simplified points: "
+        f"{metrics['raw_points_total_before_simplification']} -> "
+        f"{metrics['points_total_after_simplification']}"
+    )
     print(f"Commands: {metrics['command_count']}")
     print(f"Bounds valid: {metrics['bounds_validation_passed']}")
     for warning in metrics["warnings"]:
@@ -1166,6 +1505,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)
+    parser.add_argument("--simplification-epsilon", type=float, default=0.75)
+    parser.add_argument("--corner-angle-threshold", type=float, default=100.0)
+    parser.add_argument("--corner-min-separation", type=int, default=12)
+    parser.add_argument("--corner-lookahead", type=int, default=8)
+    parser.add_argument("--split-corners", action="store_true", help="Use accepted corners as graph-splitting vertices.")
+    parser.add_argument("--use-segmentation-node-hints", action="store_true", help="Use segmenter node masks as graph vertices.")
+    parser.add_argument("--junction-join-angle", type=float, default=35.0, help="Maximum smooth continuation angle through junctions.")
     return parser
 
 
