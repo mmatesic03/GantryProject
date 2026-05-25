@@ -1,0 +1,10 @@
+data/quickdraw/raw/*.ndjson
+data/quickdraw/processed/images/
+data/quickdraw/processed/masks/
+data/quickdraw/processed/previews/
+data/quickdraw/processed/manifest.json
+models/*.pt
+models/*.pth
+models/*.ckpt
+output/stroke_ml_debug/*
+!output/stroke_ml_debug/.gitkeep

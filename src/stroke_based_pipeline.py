@@ -128,39 +128,8 @@ class MLSegmenter(BaseSegmenter):
 
     def _segment_torch(self, image_path: Path) -> SegmentationResult:
         import torch
-        import torch.nn as nn
 
-        class DoubleConv(nn.Module):
-            def __init__(self, in_channels: int, out_channels: int):
-                super().__init__()
-                self.net = nn.Sequential(
-                    nn.Conv2d(in_channels, out_channels, 3, padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.Conv2d(out_channels, out_channels, 3, padding=1),
-                    nn.ReLU(inplace=True),
-                )
-
-            def forward(self, x):
-                return self.net(x)
-
-        class TinyUNet(nn.Module):
-            def __init__(self, out_channels: int = 3):
-                super().__init__()
-                self.down1 = DoubleConv(1, 16)
-                self.pool = nn.MaxPool2d(2)
-                self.down2 = DoubleConv(16, 32)
-                self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
-                self.up_conv = DoubleConv(48, 16)
-                self.out = nn.Conv2d(16, out_channels, 1)
-
-            def forward(self, x):
-                x1 = self.down1(x)
-                x2 = self.down2(self.pool(x1))
-                x = self.up(x2)
-                if x.shape[-2:] != x1.shape[-2:]:
-                    x = nn.functional.interpolate(x, size=x1.shape[-2:], mode="bilinear", align_corners=False)
-                x = torch.cat([x, x1], dim=1)
-                return self.out(self.up_conv(x))
+        from stroke_ml_model import build_stroke_unet
 
         gray = load_grayscale(image_path)
         tensor = torch.from_numpy(gray.astype(np.float32) / 255.0)[None, None, :, :]
@@ -168,9 +137,20 @@ class MLSegmenter(BaseSegmenter):
         try:
             model = torch.jit.load(str(self.model_path), map_location="cpu")
         except Exception:
-            model = TinyUNet(out_channels=3)
             checkpoint = torch.load(str(self.model_path), map_location="cpu")
-            state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            model_config = checkpoint.get("model_config", {}) if isinstance(checkpoint, dict) else {}
+            model = build_stroke_unet(
+                num_classes=int(model_config.get("num_classes", 3)),
+                base_channels=int(model_config.get("base_channels", 16)),
+            )
+            if isinstance(checkpoint, dict):
+                state_dict = (
+                    checkpoint.get("model_state_dict")
+                    or checkpoint.get("state_dict")
+                    or checkpoint
+                )
+            else:
+                state_dict = checkpoint
             model.load_state_dict(state_dict)
 
         model.eval()
