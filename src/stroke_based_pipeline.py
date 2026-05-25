@@ -508,6 +508,125 @@ def trace_graph_edges(skeleton: np.ndarray, label_map: np.ndarray, vertices: lis
     return edges
 
 
+def build_edge_adjacency(edges: list[dict], vertex_count: int) -> dict[int, list[int]]:
+    adjacency = {vertex_id: [] for vertex_id in range(vertex_count)}
+    for edge in edges:
+        start_vertex = edge.get("start_vertex")
+        end_vertex = edge.get("end_vertex")
+        if start_vertex is not None and start_vertex >= 0:
+            adjacency[int(start_vertex)].append(int(edge["id"]))
+        if end_vertex is not None and end_vertex >= 0 and end_vertex != start_vertex:
+            adjacency[int(end_vertex)].append(int(edge["id"]))
+    return adjacency
+
+
+def oriented_edge_path(edge: dict, from_vertex: int | None) -> tuple[np.ndarray, int | None]:
+    path = edge["path_px"]
+    start_vertex = edge.get("start_vertex")
+    end_vertex = edge.get("end_vertex")
+    if from_vertex is not None and end_vertex == from_vertex:
+        return path[::-1].copy(), start_vertex
+    return path.copy(), end_vertex
+
+
+def append_path_without_duplicate(base: list[list[float]], path: np.ndarray) -> None:
+    for point in path.tolist():
+        if base and np.allclose(np.array(base[-1]), np.array(point)):
+            continue
+        base.append(point)
+
+
+def assemble_continuous_strokes(edges: list[dict], vertices: list[dict]) -> list[np.ndarray]:
+    """
+    Merge traced graph edges into longer drawable trails.
+
+    Degree-2 vertices are treated as pass-through points, which joins corners
+    and tiny adjacent edge fragments into one ordered polyline. Vertices with
+    degree 1 or degree >= 3 remain natural stroke boundaries.
+    """
+    if not edges:
+        return []
+
+    adjacency = build_edge_adjacency(edges, len(vertices))
+    degrees = {vertex_id: len(edge_ids) for vertex_id, edge_ids in adjacency.items()}
+    used_edges: set[int] = set()
+    strokes: list[np.ndarray] = []
+
+    def walk_from(start_vertex: int, first_edge_id: int) -> np.ndarray:
+        points: list[list[float]] = []
+        current_vertex: int | None = start_vertex
+        edge_id = first_edge_id
+
+        while True:
+            used_edges.add(edge_id)
+            path, next_vertex = oriented_edge_path(edges[edge_id], current_vertex)
+            append_path_without_duplicate(points, path)
+
+            if next_vertex is None:
+                break
+            if degrees.get(next_vertex, 0) != 2:
+                break
+
+            candidates = [candidate for candidate in adjacency[next_vertex] if candidate not in used_edges]
+            if not candidates:
+                break
+            current_vertex = next_vertex
+            edge_id = candidates[0]
+
+        return np.array(points, dtype=np.float64)
+
+    boundary_vertices = [
+        vertex_id for vertex_id, degree in degrees.items()
+        if degree != 2 and degree > 0
+    ]
+    for vertex_id in boundary_vertices:
+        for edge_id in adjacency[vertex_id]:
+            if edge_id not in used_edges:
+                stroke = walk_from(vertex_id, edge_id)
+                if len(stroke) >= 2:
+                    strokes.append(stroke)
+
+    # Remaining unused edges are closed loops or all-degree-2 components.
+    for edge in edges:
+        edge_id = int(edge["id"])
+        if edge_id in used_edges:
+            continue
+        start_vertex = edge.get("start_vertex")
+        if start_vertex is None:
+            path = edge["path_px"]
+            used_edges.add(edge_id)
+            if len(path) >= 2:
+                strokes.append(path.copy())
+            continue
+
+        points: list[list[float]] = []
+        current_vertex = int(start_vertex)
+        current_edge_id = edge_id
+        while current_edge_id not in used_edges:
+            used_edges.add(current_edge_id)
+            path, next_vertex = oriented_edge_path(edges[current_edge_id], current_vertex)
+            append_path_without_duplicate(points, path)
+            if next_vertex is None:
+                break
+            current_vertex = int(next_vertex)
+            candidates = [
+                candidate for candidate in adjacency[current_vertex]
+                if candidate not in used_edges
+            ]
+            if not candidates:
+                break
+            current_edge_id = candidates[0]
+
+        if len(points) >= 2:
+            first = np.array(points[0])
+            last = np.array(points[-1])
+            if np.linalg.norm(first - last) <= 2.0:
+                points[-1] = points[0]
+            strokes.append(np.array(points, dtype=np.float64))
+
+    return strokes
+
+
 def path_to_xy_array(path: list[Pixel]) -> np.ndarray:
     return np.array([[x, y] for y, x in path], dtype=np.float64)
 
@@ -530,7 +649,12 @@ def build_stroke_graph(line_mask: np.ndarray, node_hint_mask: np.ndarray | None 
 
     vertices, label_map = cluster_vertices(node_mask, skeleton, radius=1)
     edges = trace_graph_edges(skeleton, label_map, vertices)
-    strokes = [simplify_polyline(edge["path_px"], epsilon=0.75) for edge in edges if len(edge["path_px"]) >= 2]
+    continuous_strokes = assemble_continuous_strokes(edges, vertices)
+    strokes = [
+        simplify_polyline(stroke, epsilon=0.75)
+        for stroke in continuous_strokes
+        if len(stroke) >= 2
+    ]
 
     return StrokeGraph(
         vertices=vertices,
@@ -744,11 +868,24 @@ def compute_command_metrics(
     servo_sweep_ms = abs(firmware_constants["PEN_UP_ANGLE"] - firmware_constants["PEN_DOWN_ANGLE"]) * firmware_constants["SERVO_DELAY_MS"]
     pen_change_time_s = mode_changes * (firmware_constants["PEN_SETTLE_MS"] + servo_sweep_ms) / 1000.0
     total_time_s = (draw_time_s or 0.0) + (travel_time_s or 0.0) + pen_change_time_s
+    stroke_point_counts = [int(len(stroke)) for stroke in graph.strokes_px]
+    two_point_strokes = sum(1 for count in stroke_point_counts if count == 2)
+    two_point_fraction = two_point_strokes / len(stroke_point_counts) if stroke_point_counts else 0.0
+    warnings = []
+    if two_point_fraction > 0.5:
+        warnings.append(
+            "More than 50% of extracted strokes have only two points. "
+            "Stroke extraction may still be too fragmented."
+        )
 
     return {
         "schema": "stroke_pipeline_metrics_v1",
         "command_count": len(commands),
         "stroke_count": stroke_count,
+        "average_points_per_stroke": float(np.mean(stroke_point_counts)) if stroke_point_counts else 0.0,
+        "median_points_per_stroke": float(np.median(stroke_point_counts)) if stroke_point_counts else 0.0,
+        "two_point_stroke_count": two_point_strokes,
+        "two_point_stroke_fraction": two_point_fraction,
         "pen_down_drawing_distance_mm": draw_distance,
         "pen_up_travel_distance_mm": travel_distance,
         "total_movement_distance_mm": draw_distance + travel_distance,
@@ -763,9 +900,12 @@ def compute_command_metrics(
         "segmentation_mode_used": segmentation_mode_used,
         "model_path_used": model_path_used,
         "segmentation_notes": segmentation_notes,
+        "warnings": warnings,
         "graph": {
             "vertex_count": len(graph.vertices),
             "edge_count": len(graph.edges),
+            "assembled_stroke_count": len(graph.strokes_px),
+            "stroke_point_counts": stroke_point_counts,
             "skeleton_pixel_count": int(np.count_nonzero(graph.skeleton_mask)),
             "endpoint_count": int(np.count_nonzero(graph.endpoint_mask)),
             "junction_pixel_count": int(np.count_nonzero(graph.junction_mask)),
@@ -841,7 +981,18 @@ def save_graph_debug(gray: np.ndarray, graph: StrokeGraph, output_path: Path) ->
         if len(stroke) < 2:
             continue
         points = [(float(x), float(y)) for x, y in stroke]
-        draw.line(points, fill=colors[i % len(colors)], width=2)
+        is_fragment = len(stroke) == 2
+        stroke_color = (255, 80, 0, 235) if is_fragment else colors[i % len(colors)]
+        stroke_width = 4 if is_fragment else 2
+        draw.line(points, fill=stroke_color, width=stroke_width)
+        sx, sy = points[0]
+        ex, ey = points[-1]
+        draw.ellipse((sx - 4, sy - 4, sx + 4, sy + 4), fill=(0, 190, 70, 245), outline=(0, 0, 0, 245))
+        draw.ellipse((ex - 3, ey - 3, ex + 3, ey + 3), fill=(40, 90, 255, 235), outline=(0, 0, 0, 235))
+        if is_fragment:
+            mx = (sx + ex) / 2.0
+            my = (sy + ey) / 2.0
+            draw.text((mx + 3, my + 3), "2pt", fill=(255, 80, 0, 255))
     for vertex in graph.vertices:
         x = float(vertex["x_px"])
         y = float(vertex["y_px"])
@@ -993,8 +1144,13 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     for note in segmentation.notes:
         print(f"- {note}")
     print(f"Strokes: {metrics['stroke_count']}")
+    print(f"Average points/stroke: {metrics['average_points_per_stroke']:.2f}")
+    print(f"Median points/stroke: {metrics['median_points_per_stroke']:.2f}")
+    print(f"2-point strokes: {metrics['two_point_stroke_count']}")
     print(f"Commands: {metrics['command_count']}")
     print(f"Bounds valid: {metrics['bounds_validation_passed']}")
+    for warning in metrics["warnings"]:
+        print(f"WARNING: {warning}")
     print(f"Estimated total plotting time: {metrics['estimated_total_plotting_time_s']:.2f} s")
     return metrics
 
