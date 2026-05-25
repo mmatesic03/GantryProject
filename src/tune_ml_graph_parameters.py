@@ -76,6 +76,16 @@ def make_target_mask(probabilities: MLProbabilities, source: str, threshold: flo
     return probabilities.gray <= cutoff
 
 
+def grayscale_target_mask(probabilities: MLProbabilities, threshold: float | None) -> np.ndarray:
+    cutoff = 180.0 if threshold is None else float(threshold)
+    return probabilities.gray <= cutoff
+
+
+def ml_line_target_mask(probabilities: MLProbabilities, threshold: float | None) -> np.ndarray:
+    cutoff = 0.35 if threshold is None else float(threshold)
+    return probabilities.line_prob >= cutoff
+
+
 def render_strokes_to_mask(strokes_px: list[np.ndarray], shape: tuple[int, int], line_width_px: int) -> np.ndarray:
     height, width = shape
     image = Image.new("L", (width, height), 0)
@@ -265,6 +275,104 @@ def save_mask_preview(
     Image.alpha_composite(base, overlay).convert("RGB").save(output_path)
 
 
+def diagnostic_counts(
+    original_mask: np.ndarray,
+    ml_mask: np.ndarray,
+    prediction_mask: np.ndarray,
+) -> dict[str, int | float]:
+    total_original = int(np.count_nonzero(original_mask))
+    total_ml = int(np.count_nonzero(ml_mask))
+    total_prediction = int(np.count_nonzero(prediction_mask))
+    original_and_ml = original_mask & ml_mask
+    original_not_ml = original_mask & ~ml_mask
+    original_not_prediction = original_mask & ~prediction_mask
+    ml_not_prediction = ml_mask & ~prediction_mask
+    prediction_not_original = prediction_mask & ~original_mask
+    prediction_not_ml = prediction_mask & ~ml_mask
+    graph_missed_original_supported_by_ml = original_mask & ml_mask & ~prediction_mask
+    segmentation_missed_original = original_not_ml
+    graph_drew_ml_false_positive = prediction_mask & ml_mask & ~original_mask
+    graph_false_connector_unsupported = prediction_mask & ~ml_mask & ~original_mask
+    return {
+        "original_line_pixels": total_original,
+        "ml_line_pixels": total_ml,
+        "prediction_pixels": total_prediction,
+        "original_and_ml_pixels": int(np.count_nonzero(original_and_ml)),
+        "original_missing_from_ml_pixels": int(np.count_nonzero(segmentation_missed_original)),
+        "original_missing_from_prediction_pixels": int(np.count_nonzero(original_not_prediction)),
+        "ml_missing_from_prediction_pixels": int(np.count_nonzero(ml_not_prediction)),
+        "prediction_not_original_pixels": int(np.count_nonzero(prediction_not_original)),
+        "prediction_not_ml_pixels": int(np.count_nonzero(prediction_not_ml)),
+        "graph_missed_original_supported_by_ml_pixels": int(np.count_nonzero(graph_missed_original_supported_by_ml)),
+        "graph_drew_ml_false_positive_pixels": int(np.count_nonzero(graph_drew_ml_false_positive)),
+        "graph_false_connector_unsupported_pixels": int(np.count_nonzero(graph_false_connector_unsupported)),
+        "original_supported_by_ml_fraction": float(np.count_nonzero(original_and_ml) / max(total_original, 1)),
+        "segmentation_miss_fraction": float(np.count_nonzero(segmentation_missed_original) / max(total_original, 1)),
+        "graph_miss_fraction_of_original": float(np.count_nonzero(original_not_prediction) / max(total_original, 1)),
+        "graph_miss_fraction_of_ml": float(np.count_nonzero(ml_not_prediction) / max(total_ml, 1)),
+    }
+
+
+def save_three_way_diagnostic(
+    gray: np.ndarray,
+    original_mask: np.ndarray,
+    ml_mask: np.ndarray,
+    prediction_mask: np.ndarray,
+    output_path: Path,
+) -> dict[str, int | float]:
+    """Save a mask diagnostic separating segmentation and graph failures.
+
+    Colors:
+    - green: original line reconstructed.
+    - blue: original line exists and ML line exists, but graph missed it.
+    - yellow: original line exists but ML line mask missed it.
+    - red: graph drew outside the original and outside the ML mask.
+    - purple: graph drew an ML-supported line outside the original target.
+    - gray: ML line exists but neither original nor prediction contains it.
+    """
+    counts = diagnostic_counts(original_mask, ml_mask, prediction_mask)
+    height, width = gray.shape
+    image = np.full((height, width, 3), 255, dtype=np.uint8)
+
+    ml_only_unclaimed = ml_mask & ~original_mask & ~prediction_mask
+    graph_hit_original = original_mask & prediction_mask
+    graph_missed_ml_supported = original_mask & ml_mask & ~prediction_mask
+    segmentation_missed_original = original_mask & ~ml_mask
+    graph_ml_false_positive = prediction_mask & ml_mask & ~original_mask
+    graph_unsupported_false_positive = prediction_mask & ~ml_mask & ~original_mask
+
+    image[ml_only_unclaimed] = (180, 180, 180)
+    image[graph_hit_original] = (20, 170, 80)
+    image[graph_missed_ml_supported] = (35, 90, 235)
+    image[segmentation_missed_original] = (245, 190, 30)
+    image[graph_ml_false_positive] = (170, 60, 210)
+    image[graph_unsupported_false_positive] = (230, 45, 45)
+
+    legend_h = 86
+    canvas = Image.new("RGB", (width, height + legend_h), "white")
+    canvas.paste(Image.fromarray(image, mode="RGB"), (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    legend_items = [
+        ((20, 170, 80), "green: original reconstructed"),
+        ((35, 90, 235), "blue: graph missed original line that ML sees"),
+        ((245, 190, 30), "yellow: segmentation missed original line"),
+        ((170, 60, 210), "purple: graph drew ML-only line"),
+        ((230, 45, 45), "red: graph drew unsupported line"),
+        ((180, 180, 180), "gray: ML-only unclaimed line"),
+    ]
+    x = 8
+    y = height + 8
+    for color, label in legend_items:
+        draw.rectangle((x, y + 3, x + 14, y + 17), fill=color)
+        draw.text((x + 20, y), label, fill=(20, 20, 20))
+        y += 24
+        if y > height + legend_h - 20:
+            x += 250
+            y = height + 8
+    canvas.save(output_path)
+    return counts
+
+
 def make_graph_args(tuner_args: argparse.Namespace, params: dict[str, Any]) -> argparse.Namespace:
     graph_args = build_graph_arg_parser().parse_args(
         [
@@ -397,6 +505,8 @@ def save_top_artifacts(
     results: list[RunArtifact],
     probabilities: MLProbabilities,
     target_mask: np.ndarray,
+    original_mask: np.ndarray,
+    ml_mask: np.ndarray,
     output_dir: Path,
     top_k: int,
     tuner_args: argparse.Namespace,
@@ -432,17 +542,27 @@ def save_top_artifacts(
     )
     save_strokes_debug(probabilities, best.graph, output_dir / "best_stroke_sequence_debug.png")
     save_mask_preview(probabilities.gray, target_mask, best.prediction_mask, output_dir / "best_mask_comparison.png")
+    diagnostic_summary = save_three_way_diagnostic(
+        probabilities.gray,
+        original_mask,
+        ml_mask,
+        best.prediction_mask,
+        output_dir / "best_three_way_diagnostic.png",
+    )
+    save_json(diagnostic_summary, output_dir / "best_three_way_diagnostic.json")
     save_json(
         {
             "run_index": best.index,
             "params": best.params,
             "score": best.score,
             "metrics_summary": summarize_metrics(best.metrics),
+            "three_way_diagnostic": diagnostic_summary,
             "outputs": {
                 "best_arduino_commands": "best_arduino_commands.txt",
                 "best_gantry_path_preview": "best_gantry_path_preview.png",
                 "best_stroke_sequence_debug": "best_stroke_sequence_debug.png",
                 "best_mask_comparison": "best_mask_comparison.png",
+                "best_three_way_diagnostic": "best_three_way_diagnostic.png",
             },
         },
         output_dir / "best_params.json",
@@ -458,7 +578,11 @@ def run_tuning(args: argparse.Namespace) -> list[RunArtifact]:
 
     probabilities = load_torch_probabilities(args.image_path, args.model_path)
     target_mask = make_target_mask(probabilities, args.target_source, args.target_threshold)
+    original_mask = grayscale_target_mask(probabilities, args.grayscale_target_threshold)
+    ml_mask = ml_line_target_mask(probabilities, args.ml_line_target_threshold)
     Image.fromarray(np.where(target_mask, 255, 0).astype(np.uint8), mode="L").save(args.output_dir / "target_mask.png")
+    Image.fromarray(np.where(original_mask, 255, 0).astype(np.uint8), mode="L").save(args.output_dir / "original_grayscale_mask.png")
+    Image.fromarray(np.where(ml_mask, 255, 0).astype(np.uint8), mode="L").save(args.output_dir / "ml_line_mask.png")
     firmware_constants = parse_firmware_constants(repo_root.parent / "Arduino Code" / "ArduinoCode.ino")
 
     combos = parameter_grid(args)
@@ -486,7 +610,7 @@ def run_tuning(args: argparse.Namespace) -> list[RunArtifact]:
 
     results.sort(key=lambda artifact: artifact.score["total_score"], reverse=True)
     write_results_table(results, args.output_dir)
-    save_top_artifacts(results, probabilities, target_mask, args.output_dir, args.top_k, args)
+    save_top_artifacts(results, probabilities, target_mask, original_mask, ml_mask, args.output_dir, args.top_k, args)
     print("Best score:", f"{results[0].score['total_score']:.3f}")
     print("Best params:", json.dumps(results[0].params, sort_keys=True))
     return results
@@ -500,6 +624,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=str(repo_root / "output" / "ml_graph_tuning"))
     parser.add_argument("--target-source", choices=["ml_line", "grayscale"], default="ml_line")
     parser.add_argument("--target-threshold", type=float, default=None)
+    parser.add_argument("--grayscale-target-threshold", type=float, default=None)
+    parser.add_argument("--ml-line-target-threshold", type=float, default=None)
     parser.add_argument("--max-runs", type=int, default=80)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--grid-sampling", choices=["first", "random"], default="random")

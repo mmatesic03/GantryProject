@@ -255,7 +255,19 @@ Outputs include:
 - `best_gantry_path_preview.png`: best gantry-space preview.
 - `best_stroke_sequence_debug.png`: best image-space stroke sequence.
 - `best_mask_comparison.png` and `top_###_preview.png`: blue target mask with red rendered strokes.
+- `best_three_way_diagnostic.png`: separates segmentation misses from graph misses.
+- `best_three_way_diagnostic.json`: pixel counts for each diagnostic class.
+- `original_grayscale_mask.png` and `ml_line_mask.png`: the two source masks used by the three-way diagnostic.
 - `target_mask.png`: the comparison target used by the scorer.
+
+Three-way diagnostic colors:
+
+- green: original line reconstructed.
+- blue: original line exists and ML line exists, but graph reconstruction missed it.
+- yellow: original line exists, but the ML line mask missed it.
+- purple: graph drew a line supported by the ML mask but not the original target.
+- red: graph drew a line unsupported by both the original target and ML mask.
+- gray: ML line exists but is not in the original target or rendered output.
 
 The score rewards target line coverage, low false-positive drawing, low
 Chamfer-like line distance, graph line coverage, and valid bounds. It penalizes
