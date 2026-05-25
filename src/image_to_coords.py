@@ -378,7 +378,7 @@ def merge_preserved_points_into_sampled_closed_path(
 
 def main():
     repo_root = Path(__file__).resolve().parents[1]
-    image_path = repo_root / "input_images" / "face test 3.png"
+    image_path = repo_root / "input_images" / "square.png"
     output_dir = repo_root / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
