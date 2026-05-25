@@ -64,6 +64,7 @@ class MLGraphVertex:
     max_probability: float
     source_component_id: int
     split_from_large_component: bool = False
+    source: str = "node_component"
 
 
 @dataclass
@@ -86,6 +87,10 @@ class MLGraphEdge:
     total_path_cost: float
     search_mode: str
     accepted_before_pruning: bool
+    supported_pixel_count: int = 0
+    coverage_gain_pixels: int = 0
+    coverage_overlap_fraction: float = 0.0
+    rejected_by_vertex_passthrough: bool = False
 
 
 @dataclass
@@ -100,6 +105,16 @@ class MLGraphResult:
     accepted_edges_before_pruning: list[MLGraphEdge]
     rejected_by_path_score_count: int
     rejected_by_degree_pruning_count: int
+    rejected_by_coverage_pruning_count: int
+    rejected_by_vertex_passthrough_count: int
+    node_component_vertex_count: int
+    line_anchor_vertex_count: int
+    merged_vertex_count_before: int
+    line_component_count: int
+    line_component_candidate_pair_count: int
+    claimed_line_pixel_count: int
+    line_coverage_fraction: float
+    unclaimed_line_pixel_count: int
 
 
 def load_torch_probabilities(image_path: Path, model_path: Path) -> MLProbabilities:
@@ -271,6 +286,140 @@ def extract_vertices_from_nodes(
     for i, vertex in enumerate(vertices):
         vertex.id = i
     return vertices, node_mask
+
+
+def merge_nearby_vertices(vertices: list[MLGraphVertex], merge_distance_px: float) -> list[MLGraphVertex]:
+    if merge_distance_px <= 0 or len(vertices) <= 1:
+        for i, vertex in enumerate(vertices):
+            vertex.id = i
+        return vertices
+
+    remaining = sorted(vertices, key=lambda vertex: vertex.max_probability, reverse=True)
+    clusters: list[list[MLGraphVertex]] = []
+    while remaining:
+        seed = remaining.pop(0)
+        cluster = [seed]
+        kept = []
+        for vertex in remaining:
+            if any(math.hypot(vertex.x - other.x, vertex.y - other.y) <= merge_distance_px for other in cluster):
+                cluster.append(vertex)
+            else:
+                kept.append(vertex)
+        remaining = kept
+        clusters.append(cluster)
+
+    merged: list[MLGraphVertex] = []
+    for cluster in clusters:
+        weights = np.array([max(vertex.max_probability, 1e-6) * max(vertex.area, 1) for vertex in cluster], dtype=np.float64)
+        total = float(np.sum(weights))
+        x = float(sum(vertex.x * weight for vertex, weight in zip(cluster, weights)) / total)
+        y = float(sum(vertex.y * weight for vertex, weight in zip(cluster, weights)) / total)
+        source_names = {vertex.source for vertex in cluster}
+        merged.append(
+            MLGraphVertex(
+                id=len(merged),
+                x=x,
+                y=y,
+                area=int(sum(vertex.area for vertex in cluster)),
+                mean_probability=float(np.mean([vertex.mean_probability for vertex in cluster])),
+                max_probability=float(max(vertex.max_probability for vertex in cluster)),
+                source_component_id=int(cluster[0].source_component_id),
+                split_from_large_component=any(vertex.split_from_large_component for vertex in cluster),
+                source="+".join(sorted(source_names)),
+            )
+        )
+
+    merged.sort(key=lambda vertex: (vertex.y, vertex.x))
+    for i, vertex in enumerate(merged):
+        vertex.id = i
+    return merged
+
+
+def component_min_distance_px(points_yx: np.ndarray, vertex: MLGraphVertex) -> float:
+    if len(points_yx) == 0:
+        return float("inf")
+    dx = points_yx[:, 1].astype(np.float32) - float(vertex.x)
+    dy = points_yx[:, 0].astype(np.float32) - float(vertex.y)
+    return float(np.sqrt(np.min(dx * dx + dy * dy)))
+
+
+def local_probability_stats(probability: np.ndarray, x: float, y: float, radius_px: int = 2) -> tuple[float, float]:
+    height, width = probability.shape
+    cx = int(round(x))
+    cy = int(round(y))
+    x0 = max(0, cx - radius_px)
+    x1 = min(width, cx + radius_px + 1)
+    y0 = max(0, cy - radius_px)
+    y1 = min(height, cy + radius_px + 1)
+    values = probability[y0:y1, x0:x1]
+    if values.size == 0:
+        return 0.0, 0.0
+    return float(np.mean(values)), float(np.max(values))
+
+
+def add_line_component_anchor_vertices(
+    vertices: list[MLGraphVertex],
+    line_components: list[np.ndarray],
+    line_prob: np.ndarray,
+    min_component_pixels: int,
+    min_anchor_distance_px: float,
+    max_anchors_per_component: int,
+) -> tuple[list[MLGraphVertex], int]:
+    """Add sparse virtual anchors where strong line components lack nearby corners.
+
+    Raghav-style graph reconstruction depends on useful graph vertices. For
+    smooth curves, a corner model can leave long stretches of line probability
+    without anchors, so those curves never become candidate edges. These anchors
+    are generated from the line channel only and do not use skeletonisation.
+    """
+    if max_anchors_per_component <= 0:
+        return vertices, 0
+
+    augmented = list(vertices)
+    added = 0
+    for component_id, points_yx in enumerate(line_components):
+        if len(points_yx) < min_component_pixels:
+            continue
+
+        candidates: list[tuple[float, float]] = []
+        extrema_indices = [
+            int(np.argmin(points_yx[:, 1])),
+            int(np.argmax(points_yx[:, 1])),
+            int(np.argmin(points_yx[:, 0])),
+            int(np.argmax(points_yx[:, 0])),
+        ]
+        for idx in extrema_indices:
+            y = float(points_yx[idx, 0])
+            x = float(points_yx[idx, 1])
+            if all(math.hypot(x - px, y - py) > min_anchor_distance_px for px, py in candidates):
+                candidates.append((x, y))
+
+        anchors_for_component = 0
+        for x, y in candidates:
+            if anchors_for_component >= max_anchors_per_component:
+                break
+            if any(math.hypot(x - vertex.x, y - vertex.y) < min_anchor_distance_px for vertex in augmented):
+                continue
+            mean_probability, max_probability = local_probability_stats(line_prob, x, y)
+            augmented.append(
+                MLGraphVertex(
+                    id=len(augmented),
+                    x=float(x),
+                    y=float(y),
+                    area=1,
+                    mean_probability=mean_probability,
+                    max_probability=max_probability,
+                    source_component_id=component_id,
+                    source="line_anchor",
+                )
+            )
+            added += 1
+            anchors_for_component += 1
+
+    augmented.sort(key=lambda vertex: (vertex.y, vertex.x))
+    for i, vertex in enumerate(augmented):
+        vertex.id = i
+    return augmented, added
 
 
 def sample_edge_polyline(p0: tuple[float, float], p1: tuple[float, float], step_px: float) -> np.ndarray:
@@ -487,22 +636,96 @@ def score_edge_path(
     }
 
 
-def prune_edges_by_degree(edges: list[MLGraphEdge], vertices: list[MLGraphVertex], max_degree: int) -> tuple[list[MLGraphEdge], int]:
-    if max_degree <= 0:
+def path_passes_near_other_vertex(
+    polyline: np.ndarray,
+    vertices: list[MLGraphVertex],
+    u: int,
+    v: int,
+    radius_px: float,
+) -> bool:
+    if radius_px <= 0 or len(polyline) == 0:
+        return False
+    radius_sq = radius_px * radius_px
+    for vertex in vertices:
+        if vertex.id in {u, v}:
+            continue
+        dx = polyline[:, 0] - float(vertex.x)
+        dy = polyline[:, 1] - float(vertex.y)
+        if float(np.min(dx * dx + dy * dy)) <= radius_sq:
+            return True
+    return False
+
+
+def supported_path_pixels(edge: MLGraphEdge, line_prob: np.ndarray, line_threshold: float, radius_px: int) -> set[tuple[int, int]]:
+    height, width = line_prob.shape
+    pixels: set[tuple[int, int]] = set()
+    rounded = np.rint(edge.polyline_px).astype(np.int32)
+    for x, y in rounded:
+        for dy in range(-radius_px, radius_px + 1):
+            for dx in range(-radius_px, radius_px + 1):
+                if dx * dx + dy * dy > radius_px * radius_px:
+                    continue
+                px = int(x + dx)
+                py = int(y + dy)
+                if 0 <= px < width and 0 <= py < height and float(line_prob[py, px]) >= line_threshold:
+                    pixels.add((py, px))
+    return pixels
+
+
+def prune_edges_by_degree_and_coverage(
+    edges: list[MLGraphEdge],
+    vertices: list[MLGraphVertex],
+    line_prob: np.ndarray,
+    line_mask: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[list[MLGraphEdge], int, int, int, int, float, int]:
+    if args.max_degree <= 0:
         for i, edge in enumerate(edges):
             edge.id = i
             edge.accepted = True
             edge.reason = "accepted"
-        return edges, 0
+        claimed = set()
+        for edge in edges:
+            claimed.update(supported_path_pixels(edge, line_prob, args.line_threshold, args.coverage_radius_px))
+        line_pixels = int(np.count_nonzero(line_mask))
+        claimed_count = len(claimed)
+        coverage_fraction = claimed_count / max(line_pixels, 1)
+        return edges, 0, 0, 0, claimed_count, coverage_fraction, max(line_pixels - claimed_count, 0)
 
     degree = {vertex.id: 0 for vertex in vertices}
     accepted: list[MLGraphEdge] = []
-    rejected = 0
-    for edge in sorted(edges, key=lambda item: (item.score, item.support_fraction, -item.distance_px), reverse=True):
-        if degree.get(edge.u, 0) >= max_degree or degree.get(edge.v, 0) >= max_degree:
+    claimed_pixels: set[tuple[int, int]] = set()
+    edge_pixels = {edge.id: supported_path_pixels(edge, line_prob, args.line_threshold, args.coverage_radius_px) for edge in edges}
+    for edge in edges:
+        edge.supported_pixel_count = len(edge_pixels[edge.id])
+
+    rejected_by_degree = 0
+    rejected_by_coverage = 0
+    line_pixels = int(np.count_nonzero(line_mask))
+
+    def selection_key(edge: MLGraphEdge) -> tuple[float, float, float]:
+        supported = max(edge.supported_pixel_count, 1)
+        coverage_weight = math.sqrt(float(supported))
+        return (edge.score * coverage_weight, edge.support_fraction, float(supported))
+
+    for edge in sorted(edges, key=selection_key, reverse=True):
+        pixels = edge_pixels[edge.id]
+        new_pixels = pixels - claimed_pixels
+        edge.coverage_gain_pixels = len(new_pixels)
+        edge.coverage_overlap_fraction = 1.0 - (len(new_pixels) / max(len(pixels), 1))
+        enough_new_coverage = (
+            len(new_pixels) >= args.min_edge_new_pixels
+            and (len(new_pixels) / max(len(pixels), 1)) >= args.min_edge_new_coverage_fraction
+        )
+        if not enough_new_coverage:
+            edge.accepted = False
+            edge.reason = "rejected by low new line coverage"
+            rejected_by_coverage += 1
+            continue
+        if degree.get(edge.u, 0) >= args.max_degree or degree.get(edge.v, 0) >= args.max_degree:
             edge.accepted = False
             edge.reason = "rejected by degree pruning"
-            rejected += 1
+            rejected_by_degree += 1
             continue
         degree[edge.u] = degree.get(edge.u, 0) + 1
         degree[edge.v] = degree.get(edge.v, 0) + 1
@@ -510,16 +733,36 @@ def prune_edges_by_degree(edges: list[MLGraphEdge], vertices: list[MLGraphVertex
         edge.reason = "accepted"
         edge.id = len(accepted)
         accepted.append(edge)
-    return accepted, rejected
+        claimed_pixels.update(new_pixels)
+
+    claimed_count = len(claimed_pixels)
+    coverage_fraction = claimed_count / max(line_pixels, 1)
+    return (
+        accepted,
+        rejected_by_degree,
+        rejected_by_coverage,
+        0,
+        claimed_count,
+        coverage_fraction,
+        max(line_pixels - claimed_count, 0),
+    )
 
 
 def build_candidate_edges(
     vertices: list[MLGraphVertex],
     line_prob: np.ndarray,
+    line_mask: np.ndarray,
+    line_components: list[np.ndarray],
     args: argparse.Namespace,
-) -> tuple[list[MLGraphEdge], list[MLGraphEdge], list[MLGraphEdge], int, int]:
+) -> tuple[list[MLGraphEdge], list[MLGraphEdge], list[MLGraphEdge], int, int, int, int, int, int, float, int]:
     pairs: set[tuple[int, int]] = set()
     coords = np.array([[vertex.x, vertex.y] for vertex in vertices], dtype=np.float32)
+
+    def add_pair(i: int, j: int) -> None:
+        if i == j:
+            return
+        pairs.add((min(i, j), max(i, j)))
+
     for i, vertex in enumerate(vertices):
         if len(vertices) <= 1:
             continue
@@ -533,18 +776,51 @@ def build_candidate_edges(
             distance = float(distances[j])
             if distance > args.max_edge_distance_px:
                 continue
-            pairs.add((min(i, j), max(i, j)))
+            add_pair(i, j)
             added += 1
             if added >= args.nearest_neighbors:
                 break
 
+    pair_count_before_components = len(pairs)
+    if args.use_line_component_candidates:
+        for points_yx in line_components:
+            if len(points_yx) < args.line_component_min_pixels:
+                continue
+            nearby_vertices = [
+                vertex.id
+                for vertex in vertices
+                if component_min_distance_px(points_yx, vertex) <= args.component_vertex_radius_px
+            ]
+            if len(nearby_vertices) < 2:
+                continue
+            for vertex_id in nearby_vertices:
+                distances = []
+                for other_id in nearby_vertices:
+                    if other_id == vertex_id:
+                        continue
+                    distance = float(np.linalg.norm(coords[vertex_id] - coords[other_id]))
+                    if distance <= args.component_max_edge_distance_px:
+                        distances.append((distance, other_id))
+                distances.sort()
+                for _, other_id in distances[: args.component_candidate_neighbors]:
+                    add_pair(vertex_id, other_id)
+    line_component_pair_count = len(pairs) - pair_count_before_components
+
     candidate_edges: list[MLGraphEdge] = []
     accepted_before_pruning: list[MLGraphEdge] = []
     rejected_by_path_score = 0
+    rejected_by_vertex_passthrough = 0
     for u, v in sorted(pairs):
         p0 = (vertices[u].x, vertices[u].y)
         p1 = (vertices[v].x, vertices[v].y)
         path_metrics = score_edge_path(line_prob, p0, p1, args)
+        passes_other_vertex = path_passes_near_other_vertex(
+            path_metrics["polyline"],
+            vertices,
+            u,
+            v,
+            args.vertex_passthrough_radius_px,
+        )
         accepted = bool(
             path_metrics["path_found"]
             and path_metrics["score"] >= args.edge_score_threshold
@@ -552,16 +828,21 @@ def build_candidate_edges(
             and path_metrics["support_fraction"] >= args.support_fraction_threshold
             and path_metrics["length_ratio"] <= args.max_path_to_straight_ratio
             and path_metrics["total_path_cost"] <= args.path_cost_threshold
+            and not passes_other_vertex
         )
         reason = "accepted" if accepted else "score/support below threshold"
         if not path_metrics["path_found"]:
             reason = "no low-cost probability path found"
+        elif passes_other_vertex:
+            reason = "path passes through another graph vertex"
         elif path_metrics["length_ratio"] > args.max_path_to_straight_ratio:
             reason = "path too long relative to straight distance"
         elif path_metrics["total_path_cost"] > args.path_cost_threshold:
             reason = "path cost above threshold"
         if not accepted:
             rejected_by_path_score += 1
+            if passes_other_vertex:
+                rejected_by_vertex_passthrough += 1
         edge = MLGraphEdge(
             id=len(candidate_edges),
             u=u,
@@ -581,12 +862,33 @@ def build_candidate_edges(
             total_path_cost=path_metrics["total_path_cost"],
             search_mode=args.edge_search_mode,
             accepted_before_pruning=accepted,
+            rejected_by_vertex_passthrough=passes_other_vertex,
         )
         candidate_edges.append(edge)
         if accepted:
             accepted_before_pruning.append(edge)
-    accepted_edges, rejected_by_degree = prune_edges_by_degree(accepted_before_pruning, vertices, args.max_degree)
-    return candidate_edges, accepted_before_pruning, accepted_edges, rejected_by_path_score, rejected_by_degree
+    (
+        accepted_edges,
+        rejected_by_degree,
+        rejected_by_coverage,
+        _,
+        claimed_line_pixels,
+        line_coverage_fraction,
+        unclaimed_line_pixels,
+    ) = prune_edges_by_degree_and_coverage(accepted_before_pruning, vertices, line_prob, line_mask, args)
+    return (
+        candidate_edges,
+        accepted_before_pruning,
+        accepted_edges,
+        rejected_by_path_score,
+        rejected_by_degree,
+        rejected_by_coverage,
+        rejected_by_vertex_passthrough,
+        line_component_pair_count,
+        claimed_line_pixels,
+        line_coverage_fraction,
+        unclaimed_line_pixels,
+    )
 
 
 def orient_edge(edge: MLGraphEdge, from_vertex: int) -> np.ndarray:
@@ -661,7 +963,7 @@ def extract_recursive_strokes(vertices: list[MLGraphVertex], edges: list[MLGraph
 
 
 def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> MLGraphResult:
-    vertices, node_mask = extract_vertices_from_nodes(
+    node_vertices, node_mask = extract_vertices_from_nodes(
         probabilities.node_prob,
         threshold=args.node_threshold,
         min_area=args.min_node_area,
@@ -671,9 +973,47 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         max_vertices=args.max_vertices,
     )
     line_mask = probabilities.line_prob >= args.line_threshold
-    candidate_edges, accepted_before_pruning, accepted_edges, rejected_by_path_score, rejected_by_degree = build_candidate_edges(
+    line_components = [
+        np.array(component, dtype=np.int32)
+        for component in connected_components(line_mask, connectivity=8)
+        if len(component) >= args.line_component_min_pixels
+    ]
+    vertices = list(node_vertices)
+    line_anchor_count = 0
+    if args.add_line_component_anchors:
+        vertices, line_anchor_count = add_line_component_anchor_vertices(
+            vertices,
+            line_components,
+            probabilities.line_prob,
+            min_component_pixels=args.line_component_min_pixels,
+            min_anchor_distance_px=args.line_anchor_min_distance_px,
+            max_anchors_per_component=args.max_line_anchors_per_component,
+        )
+    merged_vertex_count_before = len(vertices)
+    vertices = merge_nearby_vertices(vertices, args.merge_vertex_distance_px)
+    if len(vertices) > args.max_vertices:
+        vertices = sorted(vertices, key=lambda vertex: vertex.max_probability, reverse=True)[: args.max_vertices]
+        vertices.sort(key=lambda vertex: (vertex.y, vertex.x))
+        for i, vertex in enumerate(vertices):
+            vertex.id = i
+
+    (
+        candidate_edges,
+        accepted_before_pruning,
+        accepted_edges,
+        rejected_by_path_score,
+        rejected_by_degree,
+        rejected_by_coverage,
+        rejected_by_vertex_passthrough,
+        line_component_pair_count,
+        claimed_line_pixels,
+        line_coverage_fraction,
+        unclaimed_line_pixels,
+    ) = build_candidate_edges(
         vertices,
         probabilities.line_prob,
+        line_mask,
+        line_components,
         args,
     )
     strokes = extract_recursive_strokes(vertices, accepted_edges)
@@ -688,6 +1028,16 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         accepted_edges_before_pruning=accepted_before_pruning,
         rejected_by_path_score_count=rejected_by_path_score,
         rejected_by_degree_pruning_count=rejected_by_degree,
+        rejected_by_coverage_pruning_count=rejected_by_coverage,
+        rejected_by_vertex_passthrough_count=rejected_by_vertex_passthrough,
+        node_component_vertex_count=len(node_vertices),
+        line_anchor_vertex_count=line_anchor_count,
+        merged_vertex_count_before=merged_vertex_count_before,
+        line_component_count=len(line_components),
+        line_component_candidate_pair_count=line_component_pair_count,
+        claimed_line_pixel_count=claimed_line_pixels,
+        line_coverage_fraction=line_coverage_fraction,
+        unclaimed_line_pixel_count=unclaimed_line_pixels,
     )
 
 
@@ -783,6 +1133,10 @@ def compute_metrics(
         warnings.append("Graph remains over-connected after pruning; max vertex degree exceeds configured max_degree.")
     if graph.accepted_edges_before_pruning and len(graph.accepted_edges) / len(graph.accepted_edges_before_pruning) < 0.35:
         warnings.append("Degree pruning removed most initially accepted edges; candidate graph was over-connected.")
+    if graph.line_mask.any() and graph.line_coverage_fraction < args.line_coverage_warning_fraction:
+        warnings.append("Accepted graph paths cover a low fraction of the ML line mask; reconstruction is likely missing visible strokes.")
+    if graph.line_component_candidate_pair_count == 0 and graph.line_component_count > 0:
+        warnings.append("No extra line-component candidate pairs were added; long curved or long straight edges may be under-connected.")
 
     return {
         "schema": "stroke_ml_graph_metrics_v1",
@@ -809,7 +1163,12 @@ def compute_metrics(
         "ml_probability_diagnostics": probabilities.diagnostics,
         "graph": {
             "vertex_count": len(graph.vertices),
-            "node_component_vertex_count": len(graph.vertices),
+            "node_component_vertex_count": graph.node_component_vertex_count,
+            "line_anchor_vertex_count": graph.line_anchor_vertex_count,
+            "merged_vertex_count_before": graph.merged_vertex_count_before,
+            "merged_vertex_count_after": len(graph.vertices),
+            "line_component_count": graph.line_component_count,
+            "line_component_candidate_pair_count": graph.line_component_candidate_pair_count,
             "candidate_edge_count": len(graph.candidate_edges),
             "candidate_edge_count_before_pruning": len(graph.candidate_edges),
             "accepted_edge_count": len(graph.accepted_edges),
@@ -818,8 +1177,13 @@ def compute_metrics(
             "rejected_edge_count": len(graph.candidate_edges) - len(graph.accepted_edges),
             "rejected_by_path_score_count": graph.rejected_by_path_score_count,
             "rejected_by_degree_pruning_count": graph.rejected_by_degree_pruning_count,
+            "rejected_by_coverage_pruning_count": graph.rejected_by_coverage_pruning_count,
+            "rejected_by_vertex_passthrough_count": graph.rejected_by_vertex_passthrough_count,
             "node_mask_pixel_count": int(np.count_nonzero(graph.node_mask)),
             "line_mask_pixel_count": int(np.count_nonzero(graph.line_mask)),
+            "claimed_line_pixel_count": graph.claimed_line_pixel_count,
+            "unclaimed_line_pixel_count": graph.unclaimed_line_pixel_count,
+            "line_coverage_fraction": graph.line_coverage_fraction,
             "line_to_node_pixel_ratio": float(np.count_nonzero(graph.line_mask) / max(np.count_nonzero(graph.node_mask), 1)),
             "edge_score_mean": float(np.mean(edge_scores)) if edge_scores else 0.0,
             "edge_score_max": float(np.max(edge_scores)) if edge_scores else 0.0,
@@ -834,6 +1198,10 @@ def compute_metrics(
             "max_vertex_degree": int(max(degree_values)) if degree_values else 0,
             "vertex_degrees": {str(key): int(value) for key, value in vertex_degree.items()},
             "stroke_point_counts": [int(count) for count in stroke_point_counts],
+            "edge_coverage_gain_pixels": [int(edge.coverage_gain_pixels) for edge in graph.accepted_edges],
+            "edge_coverage_overlap_fraction_mean": float(np.mean([edge.coverage_overlap_fraction for edge in graph.accepted_edges]))
+            if graph.accepted_edges
+            else 0.0,
         },
         "thresholds": {
             "node_threshold": args.node_threshold,
@@ -850,6 +1218,18 @@ def compute_metrics(
             "max_path_to_straight_ratio": args.max_path_to_straight_ratio,
             "path_cost_threshold": args.path_cost_threshold,
             "path_max_expanded_nodes": args.path_max_expanded_nodes,
+            "use_line_component_candidates": args.use_line_component_candidates,
+            "component_vertex_radius_px": args.component_vertex_radius_px,
+            "component_candidate_neighbors": args.component_candidate_neighbors,
+            "component_max_edge_distance_px": args.component_max_edge_distance_px,
+            "merge_vertex_distance_px": args.merge_vertex_distance_px,
+            "vertex_passthrough_radius_px": args.vertex_passthrough_radius_px,
+            "coverage_radius_px": args.coverage_radius_px,
+            "min_edge_new_pixels": args.min_edge_new_pixels,
+            "min_edge_new_coverage_fraction": args.min_edge_new_coverage_fraction,
+            "add_line_component_anchors": args.add_line_component_anchors,
+            "line_anchor_min_distance_px": args.line_anchor_min_distance_px,
+            "max_line_anchors_per_component": args.max_line_anchors_per_component,
         },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
@@ -911,7 +1291,10 @@ def save_node_components_debug(probabilities: MLProbabilities, graph: MLGraphRes
         draw.point((int(x), int(y)), fill=(255, 0, 180, 160))
     for vertex in graph.vertices:
         r = 5 if vertex.split_from_large_component else 4
-        fill = (0, 190, 70, 235) if not vertex.split_from_large_component else (255, 170, 0, 235)
+        if "line_anchor" in vertex.source:
+            fill = (0, 130, 255, 235)
+        else:
+            fill = (0, 190, 70, 235) if not vertex.split_from_large_component else (255, 170, 0, 235)
         draw.ellipse((vertex.x - r, vertex.y - r, vertex.x + r, vertex.y + r), fill=fill, outline=(0, 0, 0, 235))
         draw.text((vertex.x + 6, vertex.y + 3), str(vertex.id), fill=(0, 0, 0, 255))
     Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
@@ -930,7 +1313,14 @@ def save_edge_debug(probabilities: MLProbabilities, graph: MLGraphResult, output
         straight_points = [(float(x), float(y)) for x, y in edge.straight_polyline_px]
         if len(straight_points) >= 2 and edge.search_mode in {"path", "hybrid"}:
             draw.line(straight_points, fill=(80, 80, 80, 45), width=1)
-        color = (30, 150, 90, 230) if edge.accepted else (220, 60, 60, 80)
+        if edge.accepted:
+            color = (30, 150, 90, 230)
+        elif edge.rejected_by_vertex_passthrough:
+            color = (160, 60, 210, 105)
+        elif edge.reason == "rejected by low new line coverage":
+            color = (245, 135, 20, 95)
+        else:
+            color = (220, 60, 60, 80)
         width = 2 if edge.accepted else 1
         if len(points) >= 2:
             draw.line(points, fill=color, width=width)
@@ -1030,7 +1420,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-path-to-straight-ratio", type=float, default=2.5)
     parser.add_argument("--path-min-support-fraction", type=float, default=0.35)
     parser.add_argument("--path-cost-threshold", type=float, default=1000000000.0)
-    parser.add_argument("--path-max-expanded-nodes", type=int, default=8000)
+    parser.add_argument("--path-max-expanded-nodes", type=int, default=30000)
     parser.add_argument("--max-edge-distance-px", type=float, default=180.0)
     parser.add_argument("--nearest-neighbors", type=int, default=8)
     parser.add_argument("--edge-corridor-radius-px", type=int, default=2)
@@ -1040,6 +1430,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-large-component-vertices", type=int, default=12)
     parser.add_argument("--min-vertex-separation-px", type=float, default=14.0)
     parser.add_argument("--max-vertices", type=int, default=120)
+    parser.add_argument("--merge-vertex-distance-px", type=float, default=16.0)
+    parser.add_argument("--use-line-component-candidates", action="store_true", default=True)
+    parser.add_argument("--disable-line-component-candidates", dest="use_line_component_candidates", action="store_false")
+    parser.add_argument("--line-component-min-pixels", type=int, default=12)
+    parser.add_argument("--component-vertex-radius-px", type=float, default=18.0)
+    parser.add_argument("--component-candidate-neighbors", type=int, default=10)
+    parser.add_argument("--component-max-edge-distance-px", type=float, default=1200.0)
+    parser.add_argument("--vertex-passthrough-radius-px", type=float, default=18.0)
+    parser.add_argument("--coverage-radius-px", type=int, default=2)
+    parser.add_argument("--min-edge-new-pixels", type=int, default=12)
+    parser.add_argument("--min-edge-new-coverage-fraction", type=float, default=0.30)
+    parser.add_argument("--line-coverage-warning-fraction", type=float, default=0.55)
+    parser.add_argument("--add-line-component-anchors", action="store_true", default=True)
+    parser.add_argument("--disable-line-component-anchors", dest="add_line_component_anchors", action="store_false")
+    parser.add_argument("--line-anchor-min-distance-px", type=float, default=35.0)
+    parser.add_argument("--max-line-anchors-per-component", type=int, default=4)
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)

@@ -176,7 +176,29 @@ python src/stroke_ml_graph_pipeline.py \
   --node-threshold 0.35 \
   --line-threshold 0.35 \
   --edge-score-threshold 0.18 \
-  --support-fraction-threshold 0.05
+  --support-fraction-threshold 0.05 \
+  --edge-search-mode path \
+  --max-degree 3
+```
+
+The ML-only graph path does not use skeletonisation. It now builds extra
+candidate edges from connected line-probability components, merges nearby
+duplicate corner vertices, rejects paths that pass through other graph
+vertices, and greedily keeps edges that explain new line-mask pixels. This is
+intended to handle both long square sides and smooth cat curves while avoiding
+duplicate/chord edges that reuse the same line probability.
+
+Useful reconstruction tuning flags:
+
+```bash
+--merge-vertex-distance-px 16 \
+--component-vertex-radius-px 18 \
+--component-candidate-neighbors 10 \
+--component-max-edge-distance-px 1200 \
+--vertex-passthrough-radius-px 18 \
+--coverage-radius-px 2 \
+--min-edge-new-pixels 12 \
+--min-edge-new-coverage-fraction 0.30
 ```
 
 ## Train From QuickDraw Data
