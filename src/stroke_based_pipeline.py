@@ -112,9 +112,10 @@ class MLSegmenter(BaseSegmenter):
     when present; otherwise the default order is background, line, node/corner.
     """
 
-    def __init__(self, model_path: Path, threshold: float = 0.5):
+    def __init__(self, model_path: Path, threshold: float = 0.5, ml_probability_threshold: float = 0.35):
         self.model_path = model_path
         self.threshold = threshold
+        self.ml_probability_threshold = ml_probability_threshold
 
     @staticmethod
     def framework_available_for(model_path: Path) -> bool:
@@ -177,6 +178,7 @@ class MLSegmenter(BaseSegmenter):
             self.threshold,
             class_map=class_map,
             output_shape=tuple(output_np.shape),
+            fallback_probability_threshold=self.ml_probability_threshold,
         )
         return SegmentationResult(
             gray=gray,
@@ -201,6 +203,7 @@ class MLSegmenter(BaseSegmenter):
             self.threshold,
             class_map=None,
             output_shape=tuple(output.shape),
+            fallback_probability_threshold=self.ml_probability_threshold,
         )
         return SegmentationResult(
             gray=gray,
@@ -268,6 +271,7 @@ def masks_from_model_probabilities(
     threshold: float,
     class_map: dict | None = None,
     output_shape: tuple[int, ...] | None = None,
+    fallback_probability_threshold: float = 0.35,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     probability_threshold = threshold / 255.0 if threshold > 1 else threshold
     if probs.shape[0] >= 3:
@@ -277,20 +281,38 @@ def masks_from_model_probabilities(
         predicted = np.argmax(probs, axis=0)
         line_mask = predicted == line_class
         node_mask = predicted == node_class
+        decode_mode = "multiclass_argmax"
+        if not np.any(line_mask) and line_class < probs.shape[0]:
+            probability_line_mask = probs[line_class] >= fallback_probability_threshold
+            if np.any(probability_line_mask):
+                line_mask = probability_line_mask
+                if node_class < probs.shape[0]:
+                    node_mask = probs[node_class] >= fallback_probability_threshold
+                    node_mask &= ~line_mask
+                decode_mode = "multiclass_argmax_empty_line_probability_fallback"
+        predicted_counts = {
+            str(index): int(np.count_nonzero(predicted == index))
+            for index in range(probs.shape[0])
+        }
         diagnostics = {
-            "decode_mode": "multiclass_argmax",
+            "decode_mode": decode_mode,
             "output_shape": list(output_shape) if output_shape is not None else None,
             "probability_shape": list(probs.shape),
             "class_map": normalized_class_map,
             "line_class_index": line_class,
             "node_class_index": node_class,
+            "argmax_class_pixel_counts": predicted_counts,
             "line_pixel_count": int(np.count_nonzero(line_mask)),
             "node_pixel_count": int(np.count_nonzero(node_mask)),
             "line_pixel_fraction": float(np.count_nonzero(line_mask) / line_mask.size),
             "line_probability_max": float(np.max(probs[line_class])) if line_class < probs.shape[0] else None,
+            "line_probability_mean": float(np.mean(probs[line_class])) if line_class < probs.shape[0] else None,
             "node_probability_max": float(np.max(probs[node_class])) if node_class < probs.shape[0] else None,
+            "node_probability_mean": float(np.mean(probs[node_class])) if node_class < probs.shape[0] else None,
+            "background_probability_mean": float(np.mean(probs[0])) if probs.shape[0] > 0 else None,
             "threshold": threshold,
             "threshold_used_for_decode": None,
+            "fallback_probability_threshold": fallback_probability_threshold,
         }
     else:
         line_mask = probs[0] >= probability_threshold
@@ -1219,6 +1241,11 @@ def compute_command_metrics(
             warnings.append("ML line_mask is empty; graph extraction will produce no drawing commands.")
         elif segmentation_diagnostics.get("line_pixel_fraction", 0.0) < 0.0005:
             warnings.append("ML line_mask is extremely sparse; thresholding or class decoding may be wrong.")
+        if segmentation_diagnostics.get("decode_mode") == "multiclass_argmax_empty_line_probability_fallback":
+            warnings.append(
+                "ML argmax predicted no line pixels; pipeline used the line probability map fallback. "
+                "The checkpoint may still be undertrained or background-biased."
+            )
 
     return {
         "schema": "stroke_pipeline_metrics_v1",
@@ -1471,7 +1498,10 @@ def choose_segmenter(args: argparse.Namespace, repo_root: Path) -> tuple[BaseSeg
             notes.append(message)
         else:
             notes.append(f"ML segmentation will use model: {model_path}")
-            return MLSegmenter(model_path=model_path), notes, str(model_path)
+            return MLSegmenter(
+                model_path=model_path,
+                ml_probability_threshold=args.ml_probability_threshold,
+            ), notes, str(model_path)
 
         notes.append("Falling back to heuristic segmentation.")
         return HeuristicSegmenter(threshold=args.threshold), notes, str(model_path) if model_path else None
@@ -1577,6 +1607,13 @@ def run_pipeline(args: argparse.Namespace) -> dict:
             f"node={segmentation.diagnostics.get('node_pixel_count', 0)}, "
             f"decode={segmentation.diagnostics.get('decode_mode', 'unknown')}"
         )
+        if segmentation.diagnostics.get("line_probability_max") is not None:
+            print(
+                "ML probabilities: "
+                f"line_max={segmentation.diagnostics.get('line_probability_max'):.4f}, "
+                f"line_mean={segmentation.diagnostics.get('line_probability_mean'):.4f}, "
+                f"node_max={segmentation.diagnostics.get('node_probability_max'):.4f}"
+            )
     print(f"Strokes: {metrics['stroke_count']}")
     print(f"Average points/stroke: {metrics['average_points_per_stroke']:.2f}")
     print(f"Median points/stroke: {metrics['median_points_per_stroke']:.2f}")
@@ -1603,6 +1640,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", default=None, help="Optional local ML segmentation model/checkpoint path.")
     parser.add_argument("--segmentation-mode", choices=["ml", "heuristic", "auto"], default="auto")
     parser.add_argument("--threshold", type=int, default=127, help="Heuristic dark-line threshold, 0..255.")
+    parser.add_argument(
+        "--ml-probability-threshold",
+        type=float,
+        default=0.35,
+        help="Fallback ML foreground probability threshold used only when multiclass argmax predicts no line pixels.",
+    )
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)

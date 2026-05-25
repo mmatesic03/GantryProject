@@ -36,6 +36,13 @@ class StrokePairDataset(torch.utils.data.Dataset):
         mask = np.load(self.processed_dir / record["mask"]).astype(np.int64)
         return torch.from_numpy(image[None, :, :]), torch.from_numpy(mask)
 
+    def class_counts(self, num_classes: int = 3) -> np.ndarray:
+        counts = np.zeros(num_classes, dtype=np.int64)
+        for record in self.records:
+            mask = np.load(self.processed_dir / record["mask"]).astype(np.int64)
+            counts += np.bincount(mask.reshape(-1), minlength=num_classes)[:num_classes]
+        return counts
+
 
 def ensure_smoke_data(processed_dir: Path, image_size: int) -> None:
     write_training_pairs(synthetic_samples(), processed_dir, image_size=image_size, preview_count=3)
@@ -75,6 +82,20 @@ def save_prediction_preview(image_tensor, target_tensor, prediction_tensor, outp
     canvas.save(output_path)
 
 
+def compute_class_weights(
+    counts: np.ndarray,
+    max_class_weight: float,
+    no_class_weights: bool,
+):
+    if no_class_weights:
+        return None, [1.0 for _ in counts.tolist()]
+    safe_counts = np.maximum(counts.astype(np.float64), 1.0)
+    weights = safe_counts.sum() / (len(safe_counts) * safe_counts)
+    weights = weights / np.mean(weights)
+    weights = np.clip(weights, 0.05, max_class_weight)
+    return torch.tensor(weights, dtype=torch.float32), [float(value) for value in weights.tolist()]
+
+
 def train(args: argparse.Namespace) -> dict:
     processed_dir = Path(args.processed_dir)
     if args.smoke_test:
@@ -87,7 +108,17 @@ def train(args: argparse.Namespace) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     model = build_stroke_unet(num_classes=3, base_channels=args.base_channels).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-    loss_fn = nn.CrossEntropyLoss()
+    class_counts = dataset.class_counts(num_classes=3)
+    class_weights_tensor, class_weights = compute_class_weights(
+        class_counts,
+        max_class_weight=args.max_class_weight,
+        no_class_weights=args.no_class_weights,
+    )
+    if class_weights_tensor is not None:
+        class_weights_tensor = class_weights_tensor.to(device)
+    print(f"class counts: {class_counts.tolist()}")
+    print(f"class weights: {class_weights}")
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights_tensor)
 
     history = []
     for epoch in range(args.epochs):
@@ -117,12 +148,20 @@ def train(args: argparse.Namespace) -> dict:
         "model_state_dict": model.state_dict(),
         "model_config": {"num_classes": 3, "base_channels": args.base_channels},
         "class_map": {0: "background", 1: "line", 2: "node_corner"},
+        "class_counts": class_counts.tolist(),
+        "class_weights": class_weights,
         "history": history,
     }
     model_out = Path(args.model_out)
     model_out.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, model_out)
-    summary = {"checkpoint": str(model_out), "records": len(dataset), "history": history}
+    summary = {
+        "checkpoint": str(model_out),
+        "records": len(dataset),
+        "class_counts": class_counts.tolist(),
+        "class_weights": class_weights,
+        "history": history,
+    }
     (Path(args.debug_dir) / "training_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Saved checkpoint: {model_out}")
     return summary
@@ -143,6 +182,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-dir", default="output/stroke_ml_debug")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--no-class-weights", action="store_true", help="Disable foreground-aware class weighting.")
+    parser.add_argument("--max-class-weight", type=float, default=20.0, help="Clamp inverse-frequency class weights.")
     return parser
 
 
