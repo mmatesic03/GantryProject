@@ -56,10 +56,12 @@ nbdime==4.0.2
 nbformat==5.10.4
 nest-asyncio==1.6.0
 notebook_shim==0.2.4
+numpy==2.3.5
 packaging==25.0
 pandocfilters==1.5.1
 parso==0.8.5
 pexpect==4.9.0
+Pillow==12.2.0
 platformdirs==4.5.0
 prometheus_client==0.23.1
 prompt_toolkit==3.0.52
