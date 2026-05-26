@@ -224,6 +224,32 @@ pipeline saves `node_topology_debug.png` and records node blob class counts plus
 edge rejections caused by node-topology inconsistency. This avoids treating
 inflated node masks as a global `line OR node` path field.
 
+Node-port routing is a stricter experimental layer on top of node topology. It
+detects local line-entry ports around each node/corner blob, classifies the blob
+from port geometry, and creates allowed port-to-port routes. This is intended to
+make node blobs operational topology regions instead of simple centroid
+vertices:
+
+```bash
+python src/stroke_ml_graph_pipeline.py \
+  --image input_images/cats.jpg \
+  --model-path models/stroke_unet_quickdraw_v1_best.pt \
+  --output-dir output/node_port_cats \
+  --node-threshold 0.35 \
+  --line-threshold 0.35 \
+  --edge-score-threshold 0.18 \
+  --support-fraction-threshold 0.05 \
+  --edge-search-mode path \
+  --max-degree 3 \
+  --enable-node-topology \
+  --enable-node-port-routing
+```
+
+Port routing saves `node_port_debug.png` and `node_routing_debug.png`, and adds
+metrics for detected ports, allowed/disallowed local routes, edges using node
+support, and edges rejected by node routing. It is disabled by default so runs
+can still be compared against the earlier ML graph behaviour.
+
 ## Tune ML Graph Parameters
 
 Manual tuning is slow because the best reconstruction settings depend on the
@@ -240,6 +266,8 @@ python src/tune_ml_graph_parameters.py \
   --model-path models/stroke_unet_quickdraw_pilot_best.pt \
   --output-dir output/ml_graph_tuning_cats \
   --target-source grayscale \
+  --enable-node-topology \
+  --enable-node-port-routing \
   --max-runs 80 \
   --top-k 5
 ```

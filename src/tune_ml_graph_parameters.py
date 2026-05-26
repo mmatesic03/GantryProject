@@ -395,6 +395,8 @@ def make_graph_args(tuner_args: argparse.Namespace, params: dict[str, Any]) -> a
     graph_args.nearest_neighbors = tuner_args.nearest_neighbors
     graph_args.coverage_radius_px = tuner_args.coverage_radius_px
     graph_args.min_edge_new_pixels = tuner_args.min_edge_new_pixels
+    graph_args.enable_node_topology = tuner_args.enable_node_topology or tuner_args.enable_node_port_routing
+    graph_args.enable_node_port_routing = tuner_args.enable_node_port_routing
 
     for key, value in params.items():
         setattr(graph_args, key, value)
@@ -414,6 +416,10 @@ def parameter_grid(args: argparse.Namespace) -> list[dict[str, Any]]:
         ("component_vertex_radius_px", parse_float_list(args.component_vertex_radii)),
         ("min_edge_new_coverage_fraction", parse_float_list(args.min_new_coverage_fractions)),
         ("max_degree", parse_int_list(args.max_degrees)),
+        ("node_port_radius_px", parse_float_list(args.node_port_radii)),
+        ("node_port_min_line_prob", parse_float_list(args.node_port_min_line_probs)),
+        ("node_route_angle_threshold", parse_float_list(args.node_route_angle_thresholds)),
+        ("node_route_support_weight", parse_float_list(args.node_route_support_weights)),
     ]
     combos = [
         dict(zip([name for name, _ in names_and_values], values))
@@ -643,6 +649,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--component-vertex-radii", default="14,18,24")
     parser.add_argument("--min-new-coverage-fractions", default="0.20,0.30,0.40")
     parser.add_argument("--max-degrees", default="2,3")
+    parser.add_argument("--enable-node-topology", action="store_true")
+    parser.add_argument("--enable-node-port-routing", action="store_true")
+    parser.add_argument("--node-port-radii", default="22")
+    parser.add_argument("--node-port-min-line-probs", default="0.25")
+    parser.add_argument("--node-route-angle-thresholds", default="55")
+    parser.add_argument("--node-route-support-weights", default="0.45")
 
     parser.add_argument("--path-max-expanded-nodes", type=int, default=30000)
     parser.add_argument("--path-corridor-margin-px", type=int, default=24)

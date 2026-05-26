@@ -18,7 +18,7 @@ import argparse
 import heapq
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +65,8 @@ class MLGraphVertex:
     source_component_id: int
     split_from_large_component: bool = False
     source: str = "node_component"
+    parent_node_id: int | None = None
+    parent_port_id: int | None = None
 
 
 @dataclass
@@ -93,6 +95,33 @@ class MLGraphEdge:
     rejected_by_vertex_passthrough: bool = False
     rejected_by_node_topology: bool = False
     node_topology_reason: str = ""
+    rejected_by_node_routing: bool = False
+    node_routing_reason: str = ""
+    uses_node_support: bool = False
+
+
+@dataclass
+class NodePort:
+    id: int
+    node_id: int
+    x: float
+    y: float
+    direction: tuple[float, float]
+    confidence: float
+    supporting_line_probability_mean: float
+    supporting_line_probability_max: float
+    supporting_component_id: int
+    distance_from_centroid: float
+
+
+@dataclass
+class NodeRoute:
+    node_id: int
+    port_a: int
+    port_b: int
+    allowed: bool
+    reason: str
+    confidence: float
 
 
 @dataclass
@@ -118,6 +147,8 @@ class NodeBlobTopology:
     incident_directions: list[tuple[float, float]]
     incident_angles_deg: list[float]
     points_yx: np.ndarray
+    ports: list[NodePort] = field(default_factory=list)
+    routes: list[NodeRoute] = field(default_factory=list)
 
 
 @dataclass
@@ -144,6 +175,11 @@ class MLGraphResult:
     unclaimed_line_pixel_count: int
     node_topologies: list[NodeBlobTopology]
     rejected_by_node_topology_count: int
+    rejected_by_node_routing_count: int
+    node_port_count: int
+    allowed_port_route_count: int
+    rejected_port_route_count: int
+    accepted_edges_using_node_support_count: int
 
 
 def load_torch_probabilities(image_path: Path, model_path: Path) -> MLProbabilities:
@@ -518,6 +554,224 @@ def classify_node_blob(
     return "noisy_blob", 0.25
 
 
+def cluster_node_ports(ports: list[NodePort], args: argparse.Namespace) -> list[NodePort]:
+    clustered: list[NodePort] = []
+    for port in sorted(ports, key=lambda candidate: candidate.confidence, reverse=True):
+        duplicate_index: int | None = None
+        direction = np.array(port.direction, dtype=np.float32)
+        for i, existing in enumerate(clustered):
+            existing_direction = np.array(existing.direction, dtype=np.float32)
+            angle = angle_between_vectors_deg(direction, existing_direction, undirected=True)
+            distance = math.hypot(port.x - existing.x, port.y - existing.y)
+            if angle <= args.node_port_angle_bin_degrees or distance <= args.node_port_min_separation_px:
+                duplicate_index = i
+                break
+        if duplicate_index is None:
+            port.id = len(clustered)
+            clustered.append(port)
+            continue
+
+        existing = clustered[duplicate_index]
+        weight_a = max(existing.confidence, 1e-6)
+        weight_b = max(port.confidence, 1e-6)
+        total = weight_a + weight_b
+        merged_direction = np.array(existing.direction, dtype=np.float32) * weight_a + direction * weight_b
+        norm = float(np.linalg.norm(merged_direction))
+        if norm > 1e-9:
+            merged_direction = merged_direction / norm
+        clustered[duplicate_index] = NodePort(
+            id=existing.id,
+            node_id=existing.node_id,
+            x=float((existing.x * weight_a + port.x * weight_b) / total),
+            y=float((existing.y * weight_a + port.y * weight_b) / total),
+            direction=(float(merged_direction[0]), float(merged_direction[1])),
+            confidence=float(max(existing.confidence, port.confidence)),
+            supporting_line_probability_mean=float(max(existing.supporting_line_probability_mean, port.supporting_line_probability_mean)),
+            supporting_line_probability_max=float(max(existing.supporting_line_probability_max, port.supporting_line_probability_max)),
+            supporting_component_id=existing.supporting_component_id,
+            distance_from_centroid=float(max(existing.distance_from_centroid, port.distance_from_centroid)),
+        )
+    clustered.sort(key=lambda candidate: math.atan2(candidate.direction[1], candidate.direction[0]))
+    for i, port in enumerate(clustered):
+        port.id = i
+    return clustered
+
+
+def detect_node_ports(
+    node_id: int,
+    weighted_x: float,
+    weighted_y: float,
+    bbox: tuple[int, int, int, int],
+    line_prob: np.ndarray,
+    line_mask: np.ndarray,
+    args: argparse.Namespace,
+) -> list[NodePort]:
+    height, width = line_mask.shape
+    x0, y0, x1, y1 = bbox
+    radius = int(args.node_port_radius_px)
+    ly0 = max(0, y0 - radius)
+    ly1 = min(height, y1 + radius + 1)
+    lx0 = max(0, x0 - radius)
+    lx1 = min(width, x1 + radius + 1)
+    local_line_mask = line_mask[ly0:ly1, lx0:lx1]
+    ports: list[NodePort] = []
+    for component_id, line_component in enumerate(connected_components(local_line_mask, connectivity=8)):
+        local_points = np.array(line_component, dtype=np.int32)
+        if len(local_points) == 0:
+            continue
+        global_points = local_points + np.array([ly0, lx0], dtype=np.int32)
+        values = line_prob[global_points[:, 0], global_points[:, 1]]
+        if float(np.max(values)) < args.node_port_min_line_prob:
+            continue
+
+        distances = np.sqrt((global_points[:, 1] - weighted_x) ** 2 + (global_points[:, 0] - weighted_y) ** 2)
+        nearby = distances <= args.node_port_radius_px
+        if not np.any(nearby):
+            continue
+        nearby_points = global_points[nearby]
+        nearby_values = line_prob[nearby_points[:, 0], nearby_points[:, 1]]
+        value_mask = nearby_values >= args.node_port_min_line_prob
+        if np.any(value_mask):
+            nearby_points = nearby_points[value_mask]
+            nearby_values = nearby_values[value_mask]
+
+        near_count = min(10, len(nearby_points))
+        nearest_order = np.argsort(np.sqrt((nearby_points[:, 1] - weighted_x) ** 2 + (nearby_points[:, 0] - weighted_y) ** 2))[:near_count]
+        support_points = nearby_points[nearest_order]
+        support_values = line_prob[support_points[:, 0], support_points[:, 1]]
+        port_y = float(np.mean(support_points[:, 0]))
+        port_x = float(np.mean(support_points[:, 1]))
+        direction = np.array([port_x - weighted_x, port_y - weighted_y], dtype=np.float32)
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-9:
+            continue
+        direction = direction / norm
+        distance = float(math.hypot(port_x - weighted_x, port_y - weighted_y))
+        confidence = float(np.clip(0.7 * np.mean(support_values) + 0.3 * np.max(support_values), 0.0, 1.0))
+        ports.append(
+            NodePort(
+                id=len(ports),
+                node_id=node_id,
+                x=port_x,
+                y=port_y,
+                direction=(float(direction[0]), float(direction[1])),
+                confidence=confidence,
+                supporting_line_probability_mean=float(np.mean(support_values)),
+                supporting_line_probability_max=float(np.max(support_values)),
+                supporting_component_id=component_id,
+                distance_from_centroid=distance,
+            )
+        )
+    return cluster_node_ports(ports, args)
+
+
+def classify_node_blob_from_ports(
+    area: int,
+    aspect_ratio: float,
+    ports: list[NodePort],
+    incident_angles: list[float],
+    args: argparse.Namespace,
+) -> tuple[str, float]:
+    port_count = len(ports)
+    if port_count <= 0:
+        if area < args.node_blob_min_area:
+            return "noisy_blob", 0.35
+        return "noisy_blob", 0.30
+    if port_count == 1:
+        return "endpoint", 0.75
+    if port_count == 2:
+        angle = incident_angles[0] if incident_angles else 180.0
+        if aspect_ratio >= args.line_like_node_aspect_threshold and angle >= args.node_topology_angle_threshold:
+            return "line_like_node_fragment", 0.72
+        if angle >= args.node_topology_angle_threshold:
+            return "smooth_bend", 0.72
+        return "sharp_corner", 0.78
+    if port_count == 3:
+        return "t_junction", 0.72
+    if port_count >= 4:
+        opposite_pairs = 0
+        for angle in incident_angles:
+            if angle >= args.node_topology_angle_threshold:
+                opposite_pairs += 1
+        if opposite_pairs >= 2:
+            return "crossing_or_overlap", 0.68
+        if port_count > args.max_node_blob_degree:
+            return "multi_junction", 0.50
+        return "multi_junction", 0.62
+    return classify_node_blob(area, aspect_ratio, port_count, incident_angles, args)
+
+
+def build_node_routes(blob: NodeBlobTopology, args: argparse.Namespace) -> list[NodeRoute]:
+    ports = blob.ports
+    routes: list[NodeRoute] = []
+    if len(ports) < 2:
+        return routes
+
+    pair_scores: list[tuple[float, float, int, int]] = []
+    for i in range(len(ports)):
+        for j in range(i + 1, len(ports)):
+            angle = angle_between_vectors_deg(
+                np.array(ports[i].direction, dtype=np.float32),
+                np.array(ports[j].direction, dtype=np.float32),
+                undirected=False,
+            )
+            confidence = float((ports[i].confidence + ports[j].confidence) * 0.5)
+            pair_scores.append((angle, confidence, i, j))
+
+    allowed_pairs: set[tuple[int, int]] = set()
+    class_name = blob.class_name
+    if class_name == "endpoint":
+        allowed_pairs = set()
+    elif class_name in {"smooth_bend", "line_like_node_fragment"}:
+        best = max(pair_scores, key=lambda item: (item[0], item[1]))
+        allowed_pairs.add((best[2], best[3]))
+    elif class_name == "sharp_corner":
+        best = max(pair_scores, key=lambda item: (item[1], -abs(item[0] - 90.0)))
+        allowed_pairs.add((best[2], best[3]))
+    elif class_name == "t_junction":
+        trunk = max(pair_scores, key=lambda item: (item[0], item[1]))
+        allowed_pairs.add((trunk[2], trunk[3]))
+        branch_pairs = sorted(
+            [item for item in pair_scores if item[2] not in trunk[2:4] or item[3] not in trunk[2:4]],
+            key=lambda item: (item[1], -abs(item[0] - 90.0)),
+            reverse=True,
+        )
+        for _, _, i, j in branch_pairs[: max(0, args.node_route_max_pairs - 1)]:
+            allowed_pairs.add((i, j))
+    elif class_name == "crossing_or_overlap":
+        used_ports: set[int] = set()
+        for _, _, i, j in sorted(pair_scores, key=lambda item: (item[0], item[1]), reverse=True):
+            if i in used_ports or j in used_ports:
+                continue
+            allowed_pairs.add((i, j))
+            used_ports.update({i, j})
+            if len(allowed_pairs) >= args.node_route_max_pairs:
+                break
+    elif class_name == "multi_junction":
+        for _, _, i, j in sorted(pair_scores, key=lambda item: (item[1], item[0]), reverse=True)[: args.node_route_max_pairs]:
+            allowed_pairs.add((i, j))
+    elif class_name == "noisy_blob":
+        for angle, confidence, i, j in pair_scores:
+            if angle >= args.node_route_angle_threshold and confidence >= args.node_port_min_line_prob:
+                allowed_pairs.add((i, j))
+
+    for angle, confidence, i, j in pair_scores:
+        key = (i, j)
+        allowed = key in allowed_pairs or (j, i) in allowed_pairs
+        reason = "allowed route" if allowed else f"disallowed {class_name} route"
+        routes.append(
+            NodeRoute(
+                node_id=blob.id,
+                port_a=i,
+                port_b=j,
+                allowed=allowed,
+                reason=reason,
+                confidence=float(confidence),
+            )
+        )
+    return routes
+
+
 def analyze_node_topologies(
     node_prob: np.ndarray,
     line_prob: np.ndarray,
@@ -576,42 +830,56 @@ def analyze_node_topologies(
                 if all(angle_between_vectors_deg(unit, np.array(existing), undirected=True) > args.node_direction_bin_degrees for existing in incident_directions):
                     incident_directions.append((float(unit[0]), float(unit[1])))
 
+        ports = detect_node_ports(
+            node_id=component_id,
+            weighted_x=float(weighted_x),
+            weighted_y=float(weighted_y),
+            bbox=(x0, y0, x1, y1),
+            line_prob=line_prob,
+            line_mask=line_mask,
+            args=args,
+        )
+        port_directions = [port.direction for port in ports]
         incident_angles: list[float] = []
-        for i in range(len(incident_directions)):
-            for j in range(i + 1, len(incident_directions)):
+        for i in range(len(port_directions)):
+            for j in range(i + 1, len(port_directions)):
                 incident_angles.append(
                     angle_between_vectors_deg(
-                        np.array(incident_directions[i], dtype=np.float32),
-                        np.array(incident_directions[j], dtype=np.float32),
+                        np.array(port_directions[i], dtype=np.float32),
+                        np.array(port_directions[j], dtype=np.float32),
                         undirected=False,
                     )
                 )
-        class_name, confidence = classify_node_blob(area, aspect_ratio, len(incident_directions), incident_angles, args)
-        topologies.append(
-            NodeBlobTopology(
-                id=component_id,
-                class_name=class_name,
-                confidence=confidence,
-                area=area,
-                centroid_x=centroid_x,
-                centroid_y=centroid_y,
-                weighted_centroid_x=float(weighted_x),
-                weighted_centroid_y=float(weighted_y),
-                bbox=(x0, y0, x1, y1),
-                width=bbox_w,
-                height=bbox_h,
-                aspect_ratio=float(aspect_ratio),
-                elongation=float(aspect_ratio),
-                node_probability_mean=float(np.mean(values)),
-                node_probability_max=float(np.max(values)),
-                local_line_probability_mean=float(np.mean(local_line_prob)) if local_line_prob.size else 0.0,
-                local_line_probability_max=float(np.max(local_line_prob)) if local_line_prob.size else 0.0,
-                incident_line_component_count=int(incident_count),
-                incident_directions=incident_directions,
-                incident_angles_deg=[float(angle) for angle in incident_angles],
-                points_yx=points_yx,
-            )
+        if args.enable_node_port_routing:
+            class_name, confidence = classify_node_blob_from_ports(area, aspect_ratio, ports, incident_angles, args)
+        else:
+            class_name, confidence = classify_node_blob(area, aspect_ratio, len(incident_directions), incident_angles, args)
+        blob = NodeBlobTopology(
+            id=component_id,
+            class_name=class_name,
+            confidence=confidence,
+            area=area,
+            centroid_x=centroid_x,
+            centroid_y=centroid_y,
+            weighted_centroid_x=float(weighted_x),
+            weighted_centroid_y=float(weighted_y),
+            bbox=(x0, y0, x1, y1),
+            width=bbox_w,
+            height=bbox_h,
+            aspect_ratio=float(aspect_ratio),
+            elongation=float(aspect_ratio),
+            node_probability_mean=float(np.mean(values)),
+            node_probability_max=float(np.max(values)),
+            local_line_probability_mean=float(np.mean(local_line_prob)) if local_line_prob.size else 0.0,
+            local_line_probability_max=float(np.max(local_line_prob)) if local_line_prob.size else 0.0,
+            incident_line_component_count=int(incident_count),
+            incident_directions=port_directions if args.enable_node_port_routing else incident_directions,
+            incident_angles_deg=[float(angle) for angle in incident_angles],
+            points_yx=points_yx,
+            ports=ports,
         )
+        blob.routes = build_node_routes(blob, args)
+        topologies.append(blob)
     return topologies
 
 
@@ -621,7 +889,8 @@ def node_support_probability_field(
     node_topologies: list[NodeBlobTopology],
     args: argparse.Namespace,
 ) -> np.ndarray:
-    if not args.enable_node_topology or args.node_support_weight <= 0:
+    support_weight = args.node_route_support_weight if args.enable_node_port_routing else args.node_support_weight
+    if not (args.enable_node_topology or args.enable_node_port_routing) or support_weight <= 0:
         return line_prob
     support = line_prob.copy()
     local_node_mask = np.zeros_like(line_prob, dtype=bool)
@@ -630,9 +899,68 @@ def node_support_probability_field(
             continue
         local_node_mask[blob.points_yx[:, 0], blob.points_yx[:, 1]] = True
     local_node_mask = expanded_mask(local_node_mask, int(args.node_support_radius_px))
-    boosted = np.clip(line_prob + args.node_support_weight * node_prob, 0.0, 1.0)
+    boosted = np.clip(line_prob + support_weight * node_prob, 0.0, 1.0)
     support[local_node_mask] = np.maximum(support[local_node_mask], boosted[local_node_mask])
     return support
+
+
+def add_node_port_vertices(
+    vertices: list[MLGraphVertex],
+    node_topologies: list[NodeBlobTopology],
+    line_prob: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[list[MLGraphVertex], int]:
+    if not args.enable_node_port_routing:
+        return vertices, 0
+    augmented = list(vertices)
+    added = 0
+    for blob in node_topologies:
+        if blob.class_name == "noisy_blob":
+            continue
+        for port in blob.ports:
+            if port.confidence < args.node_port_min_line_prob:
+                continue
+            if any(
+                vertex.parent_node_id == blob.id and math.hypot(vertex.x - port.x, vertex.y - port.y) < args.node_port_min_separation_px
+                for vertex in augmented
+            ):
+                continue
+            mean_probability, max_probability = local_probability_stats(line_prob, port.x, port.y)
+            augmented.append(
+                MLGraphVertex(
+                    id=len(augmented),
+                    x=float(port.x),
+                    y=float(port.y),
+                    area=1,
+                    mean_probability=float(max(mean_probability, port.supporting_line_probability_mean)),
+                    max_probability=float(max(max_probability, port.supporting_line_probability_max)),
+                    source_component_id=blob.id,
+                    source="node_port",
+                    parent_node_id=blob.id,
+                    parent_port_id=port.id,
+                )
+            )
+            added += 1
+    augmented.sort(key=lambda vertex: (vertex.y, vertex.x))
+    for i, vertex in enumerate(augmented):
+        vertex.id = i
+    return augmented, added
+
+
+def route_allowed_for_ports(blob: NodeBlobTopology, port_a: int, port_b: int) -> tuple[bool, str]:
+    if port_a == port_b:
+        return True, "same node port"
+    for route in blob.routes:
+        if {route.port_a, route.port_b} == {port_a, port_b}:
+            return route.allowed, route.reason
+    return False, f"no route between node {blob.id} ports {port_a} and {port_b}"
+
+
+def vertex_port(vertices: list[MLGraphVertex], vertex_id: int) -> tuple[int, int] | None:
+    vertex = vertices[vertex_id]
+    if vertex.parent_node_id is None or vertex.parent_port_id is None:
+        return None
+    return int(vertex.parent_node_id), int(vertex.parent_port_id)
 
 
 def sample_edge_polyline(p0: tuple[float, float], p1: tuple[float, float], step_px: float) -> np.ndarray:
@@ -916,6 +1244,62 @@ def edge_node_topology_conflict(
     return False, ""
 
 
+def edge_node_routing_conflict(
+    polyline: np.ndarray,
+    node_topologies: list[NodeBlobTopology],
+    vertices: list[MLGraphVertex],
+    u: int,
+    v: int,
+    args: argparse.Namespace,
+) -> tuple[bool, str, bool]:
+    if not args.enable_node_port_routing or len(polyline) < 2:
+        return False, "", False
+
+    blob_by_id = {blob.id: blob for blob in node_topologies}
+    u_port = vertex_port(vertices, u)
+    v_port = vertex_port(vertices, v)
+    uses_node_support = False
+
+    if u_port and v_port and u_port[0] == v_port[0]:
+        blob = blob_by_id.get(u_port[0])
+        if blob is None:
+            return True, f"missing parent node {u_port[0]}", uses_node_support
+        allowed, reason = route_allowed_for_ports(blob, u_port[1], v_port[1])
+        return (not allowed), reason, True
+
+    endpoint_ports = {item for item in (u_port, v_port) if item is not None}
+    for blob in node_topologies:
+        center = np.array([blob.weighted_centroid_x, blob.weighted_centroid_y], dtype=np.float32)
+        distances = np.linalg.norm(polyline.astype(np.float32) - center[None, :], axis=1)
+        nearest_i = int(np.argmin(distances))
+        if float(distances[nearest_i]) > args.node_support_radius_px:
+            continue
+
+        uses_node_support = True
+        matched_endpoint = next((item for item in endpoint_ports if item[0] == blob.id), None)
+        lo = max(0, nearest_i - 3)
+        hi = min(len(polyline) - 1, nearest_i + 3)
+        direction = polyline[hi].astype(np.float32) - polyline[lo].astype(np.float32)
+        norm = float(np.linalg.norm(direction))
+        if norm > 1e-9:
+            direction = direction / norm
+
+        if matched_endpoint is not None:
+            port = next((candidate for candidate in blob.ports if candidate.id == matched_endpoint[1]), None)
+            if port is None:
+                return True, f"missing endpoint port {matched_endpoint[1]} for node {blob.id}", uses_node_support
+            if norm > 1e-9 and angle_between_vectors_deg(direction, np.array(port.direction, dtype=np.float32), undirected=True) > args.node_route_angle_threshold:
+                return True, f"edge leaves node {blob.id} through mismatched port {port.id}", uses_node_support
+            continue
+
+        if blob.class_name in {"endpoint", "noisy_blob"}:
+            return True, f"edge crosses {blob.class_name} without terminating at a port", uses_node_support
+        if norm > 1e-9 and not direction_matches_blob(direction, blob, args.node_route_angle_threshold):
+            return True, f"edge crosses node {blob.id} without matching an incident port", uses_node_support
+
+    return False, "", uses_node_support
+
+
 def supported_path_pixels(edge: MLGraphEdge, line_prob: np.ndarray, line_threshold: float, radius_px: int) -> set[tuple[int, int]]:
     height, width = line_prob.shape
     pixels: set[tuple[int, int]] = set()
@@ -1016,7 +1400,7 @@ def build_candidate_edges(
     line_components: list[np.ndarray],
     node_topologies: list[NodeBlobTopology],
     args: argparse.Namespace,
-) -> tuple[list[MLGraphEdge], list[MLGraphEdge], list[MLGraphEdge], int, int, int, int, int, int, int, float, int]:
+) -> tuple[list[MLGraphEdge], list[MLGraphEdge], list[MLGraphEdge], int, int, int, int, int, int, int, int, int, float, int]:
     pairs: set[tuple[int, int]] = set()
     coords = np.array([[vertex.x, vertex.y] for vertex in vertices], dtype=np.float32)
 
@@ -1044,6 +1428,21 @@ def build_candidate_edges(
                 break
 
     pair_count_before_components = len(pairs)
+    if args.enable_node_port_routing:
+        port_vertex_by_key = {
+            (int(vertex.parent_node_id), int(vertex.parent_port_id)): vertex.id
+            for vertex in vertices
+            if vertex.parent_node_id is not None and vertex.parent_port_id is not None
+        }
+        for blob in node_topologies:
+            for route in blob.routes:
+                if not route.allowed:
+                    continue
+                a = port_vertex_by_key.get((blob.id, route.port_a))
+                b = port_vertex_by_key.get((blob.id, route.port_b))
+                if a is not None and b is not None:
+                    add_pair(a, b)
+
     if args.use_line_component_candidates:
         for points_yx in line_components:
             if len(points_yx) < args.line_component_min_pixels:
@@ -1072,6 +1471,7 @@ def build_candidate_edges(
     accepted_before_pruning: list[MLGraphEdge] = []
     rejected_by_path_score = 0
     rejected_by_vertex_passthrough = 0
+    rejected_by_node_routing = 0
     for u, v in sorted(pairs):
         p0 = (vertices[u].x, vertices[u].y)
         p1 = (vertices[v].x, vertices[v].y)
@@ -1091,6 +1491,14 @@ def build_candidate_edges(
             v,
             args,
         )
+        routing_conflict, routing_conflict_reason, uses_node_support = edge_node_routing_conflict(
+            path_metrics["polyline"],
+            node_topologies,
+            vertices,
+            u,
+            v,
+            args,
+        )
         accepted = bool(
             path_metrics["path_found"]
             and path_metrics["score"] >= args.edge_score_threshold
@@ -1100,10 +1508,13 @@ def build_candidate_edges(
             and path_metrics["total_path_cost"] <= args.path_cost_threshold
             and not passes_other_vertex
             and not node_conflict
+            and not routing_conflict
         )
         reason = "accepted" if accepted else "score/support below threshold"
         if not path_metrics["path_found"]:
             reason = "no low-cost probability path found"
+        elif routing_conflict:
+            reason = routing_conflict_reason
         elif node_conflict:
             reason = node_conflict_reason
         elif passes_other_vertex:
@@ -1116,6 +1527,8 @@ def build_candidate_edges(
             rejected_by_path_score += 1
             if passes_other_vertex:
                 rejected_by_vertex_passthrough += 1
+            if routing_conflict:
+                rejected_by_node_routing += 1
         edge = MLGraphEdge(
             id=len(candidate_edges),
             u=u,
@@ -1138,6 +1551,9 @@ def build_candidate_edges(
             rejected_by_vertex_passthrough=passes_other_vertex,
             rejected_by_node_topology=node_conflict,
             node_topology_reason=node_conflict_reason,
+            rejected_by_node_routing=routing_conflict,
+            node_routing_reason=routing_conflict_reason,
+            uses_node_support=uses_node_support,
         )
         candidate_edges.append(edge)
         if accepted:
@@ -1160,6 +1576,7 @@ def build_candidate_edges(
         rejected_by_coverage,
         rejected_by_vertex_passthrough,
         sum(1 for edge in candidate_edges if edge.rejected_by_node_topology),
+        rejected_by_node_routing,
         line_component_pair_count,
         claimed_line_pixels,
         line_coverage_fraction,
@@ -1275,6 +1692,9 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         )
     merged_vertex_count_before = len(vertices)
     vertices = merge_nearby_vertices(vertices, args.merge_vertex_distance_px)
+    port_vertex_count = 0
+    if args.enable_node_port_routing:
+        vertices, port_vertex_count = add_node_port_vertices(vertices, node_topologies, probabilities.line_prob, args)
     if len(vertices) > args.max_vertices:
         vertices = sorted(vertices, key=lambda vertex: vertex.max_probability, reverse=True)[: args.max_vertices]
         vertices.sort(key=lambda vertex: (vertex.y, vertex.x))
@@ -1290,6 +1710,7 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         rejected_by_coverage,
         rejected_by_vertex_passthrough,
         rejected_by_node_topology,
+        rejected_by_node_routing,
         line_component_pair_count,
         claimed_line_pixels,
         line_coverage_fraction,
@@ -1319,7 +1740,7 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         rejected_by_vertex_passthrough_count=rejected_by_vertex_passthrough,
         node_component_vertex_count=len(node_vertices),
         line_anchor_vertex_count=line_anchor_count,
-        merged_vertex_count_before=merged_vertex_count_before,
+        merged_vertex_count_before=merged_vertex_count_before + port_vertex_count,
         line_component_count=len(line_components),
         line_component_candidate_pair_count=line_component_pair_count,
         claimed_line_pixel_count=claimed_line_pixels,
@@ -1327,6 +1748,11 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         unclaimed_line_pixel_count=unclaimed_line_pixels,
         node_topologies=node_topologies,
         rejected_by_node_topology_count=rejected_by_node_topology,
+        rejected_by_node_routing_count=rejected_by_node_routing,
+        node_port_count=sum(len(blob.ports) for blob in node_topologies),
+        allowed_port_route_count=sum(1 for blob in node_topologies for route in blob.routes if route.allowed),
+        rejected_port_route_count=sum(1 for blob in node_topologies for route in blob.routes if not route.allowed),
+        accepted_edges_using_node_support_count=sum(1 for edge in accepted_edges if edge.uses_node_support),
     )
 
 
@@ -1411,9 +1837,11 @@ def compute_metrics(
     degree_values = list(vertex_degree.values())
     node_class_counts: dict[str, int] = {}
     incident_counts = []
+    port_counts = []
     for blob in graph.node_topologies:
         node_class_counts[blob.class_name] = node_class_counts.get(blob.class_name, 0) + 1
         incident_counts.append(len(blob.incident_directions))
+        port_counts.append(len(blob.ports))
     warnings = []
     if not graph.vertices:
         warnings.append("No ML node/corner components became graph vertices.")
@@ -1431,6 +1859,12 @@ def compute_metrics(
         warnings.append("Accepted graph paths cover a low fraction of the ML line mask; reconstruction is likely missing visible strokes.")
     if graph.line_component_candidate_pair_count == 0 and graph.line_component_count > 0:
         warnings.append("No extra line-component candidate pairs were added; long curved or long straight edges may be under-connected.")
+    if args.enable_node_port_routing and graph.node_topologies:
+        zero_port_fraction = sum(1 for count in port_counts if count == 0) / max(len(port_counts), 1)
+        if zero_port_fraction > 0.35:
+            warnings.append("Many node blobs have no detected ports; node-port routing may be under-connected.")
+        if graph.candidate_edges and graph.rejected_by_node_routing_count / max(len(graph.candidate_edges), 1) > 0.45:
+            warnings.append("Many candidate edges were rejected by node-port routing; routing thresholds may be too strict.")
 
     return {
         "schema": "stroke_ml_graph_metrics_v1",
@@ -1474,6 +1908,7 @@ def compute_metrics(
             "rejected_by_coverage_pruning_count": graph.rejected_by_coverage_pruning_count,
             "rejected_by_vertex_passthrough_count": graph.rejected_by_vertex_passthrough_count,
             "rejected_by_node_topology_count": graph.rejected_by_node_topology_count,
+            "rejected_by_node_routing_count": graph.rejected_by_node_routing_count,
             "node_mask_pixel_count": int(np.count_nonzero(graph.node_mask)),
             "line_mask_pixel_count": int(np.count_nonzero(graph.line_mask)),
             "claimed_line_pixel_count": graph.claimed_line_pixel_count,
@@ -1509,6 +1944,12 @@ def compute_metrics(
             "noisy_or_ambiguous_blob_count": node_class_counts.get("noisy_blob", 0),
             "average_incident_direction_count": float(np.mean(incident_counts)) if incident_counts else 0.0,
             "max_incident_direction_count": int(max(incident_counts)) if incident_counts else 0,
+            "node_port_count": graph.node_port_count,
+            "average_ports_per_blob": float(np.mean(port_counts)) if port_counts else 0.0,
+            "max_ports_per_blob": int(max(port_counts)) if port_counts else 0,
+            "allowed_port_route_count": graph.allowed_port_route_count,
+            "rejected_port_route_count": graph.rejected_port_route_count,
+            "accepted_edges_using_node_support_count": graph.accepted_edges_using_node_support_count,
         },
         "thresholds": {
             "node_threshold": args.node_threshold,
@@ -1546,6 +1987,14 @@ def compute_metrics(
             "max_node_blob_degree": args.max_node_blob_degree,
             "node_topology_angle_threshold": args.node_topology_angle_threshold,
             "line_like_node_aspect_threshold": args.line_like_node_aspect_threshold,
+            "enable_node_port_routing": args.enable_node_port_routing,
+            "node_port_radius_px": args.node_port_radius_px,
+            "node_port_min_line_prob": args.node_port_min_line_prob,
+            "node_port_min_separation_px": args.node_port_min_separation_px,
+            "node_port_angle_bin_degrees": args.node_port_angle_bin_degrees,
+            "node_route_angle_threshold": args.node_route_angle_threshold,
+            "node_route_support_weight": args.node_route_support_weight,
+            "node_route_max_pairs": args.node_route_max_pairs,
         },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
@@ -1631,6 +2080,8 @@ def save_edge_debug(probabilities: MLProbabilities, graph: MLGraphResult, output
             draw.line(straight_points, fill=(80, 80, 80, 45), width=1)
         if edge.accepted:
             color = (30, 150, 90, 230)
+        elif edge.rejected_by_node_routing:
+            color = (0, 120, 255, 130)
         elif edge.rejected_by_vertex_passthrough:
             color = (160, 60, 210, 105)
         elif edge.rejected_by_node_topology:
@@ -1671,7 +2122,54 @@ def save_node_topology_debug(probabilities: MLProbabilities, graph: MLGraphResul
         draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=(0, 0, 0, 230))
         for dx, dy in blob.incident_directions:
             draw.line((cx, cy, cx + dx * 16, cy + dy * 16), fill=(0, 0, 0, 210), width=2)
+        for port in blob.ports:
+            px = float(port.x)
+            py = float(port.y)
+            dx, dy = port.direction
+            draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 255, 255, 245), outline=(0, 0, 0, 245))
+            draw.line((px, py, px + dx * 14, py + dy * 14), fill=(20, 20, 20, 225), width=2)
         draw.text((cx + 5, cy + 3), f"{blob.id}:{blob.class_name}", fill=(0, 0, 0, 255))
+    Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
+
+
+def save_node_port_debug(probabilities: MLProbabilities, graph: MLGraphResult, output_path: Path) -> None:
+    image = Image.fromarray(probabilities.gray, mode="L").convert("RGB")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for blob in graph.node_topologies:
+        cx = float(blob.weighted_centroid_x)
+        cy = float(blob.weighted_centroid_y)
+        draw.ellipse((cx - 2, cy - 2, cx + 2, cy + 2), fill=(0, 0, 0, 220))
+        for port in blob.ports:
+            px = float(port.x)
+            py = float(port.y)
+            dx, dy = port.direction
+            confidence_color = int(np.clip(port.confidence * 255, 0, 255))
+            fill = (255 - confidence_color, confidence_color, 40, 235)
+            draw.line((cx, cy, px, py), fill=(20, 20, 20, 90), width=1)
+            draw.ellipse((px - 4, py - 4, px + 4, py + 4), fill=fill, outline=(0, 0, 0, 240))
+            draw.line((px, py, px + dx * 18, py + dy * 18), fill=(0, 0, 0, 220), width=2)
+            draw.text((px + 5, py + 3), f"{blob.id}:{port.id}", fill=(0, 0, 0, 255))
+    Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
+
+
+def save_node_routing_debug(probabilities: MLProbabilities, graph: MLGraphResult, output_path: Path) -> None:
+    image = Image.fromarray(probabilities.gray, mode="L").convert("RGB")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for blob in graph.node_topologies:
+        port_by_id = {port.id: port for port in blob.ports}
+        for route in blob.routes:
+            port_a = port_by_id.get(route.port_a)
+            port_b = port_by_id.get(route.port_b)
+            if port_a is None or port_b is None:
+                continue
+            color = (20, 170, 80, 230) if route.allowed else (220, 60, 60, 90)
+            width = 3 if route.allowed else 1
+            draw.line((port_a.x, port_a.y, blob.weighted_centroid_x, blob.weighted_centroid_y, port_b.x, port_b.y), fill=color, width=width)
+        for port in blob.ports:
+            draw.ellipse((port.x - 3, port.y - 3, port.x + 3, port.y + 3), fill=(255, 230, 0, 240), outline=(0, 0, 0, 240))
+        draw.text((blob.weighted_centroid_x + 4, blob.weighted_centroid_y + 4), f"{blob.id}:{blob.class_name}", fill=(0, 0, 0, 255))
     Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
 
 
@@ -1727,6 +2225,8 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     save_probability_debug(probabilities, graph, output_dir / "ml_probability_debug.png")
     save_node_components_debug(probabilities, graph, output_dir / "node_components_debug.png")
     save_node_topology_debug(probabilities, graph, output_dir / "node_topology_debug.png")
+    save_node_port_debug(probabilities, graph, output_dir / "node_port_debug.png")
+    save_node_routing_debug(probabilities, graph, output_dir / "node_routing_debug.png")
     save_edge_debug(probabilities, graph, output_dir / "candidate_edges_debug.png")
     save_edge_debug(probabilities, graph, output_dir / "graph_debug.png")
     save_strokes_debug(probabilities, graph, output_dir / "stroke_sequence_debug.png")
@@ -1803,6 +2303,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-node-blob-degree", type=int, default=4)
     parser.add_argument("--node-topology-angle-threshold", type=float, default=135.0)
     parser.add_argument("--line-like-node-aspect-threshold", type=float, default=2.8)
+    parser.add_argument("--enable-node-port-routing", action="store_true", help="Use node/corner blob ports as local routing regions.")
+    parser.add_argument("--disable-node-port-routing", dest="enable_node_port_routing", action="store_false")
+    parser.set_defaults(enable_node_port_routing=False)
+    parser.add_argument("--node-port-radius-px", type=float, default=22.0)
+    parser.add_argument("--node-port-min-line-prob", type=float, default=0.25)
+    parser.add_argument("--node-port-min-separation-px", type=float, default=6.0)
+    parser.add_argument("--node-port-angle-bin-degrees", type=float, default=20.0)
+    parser.add_argument("--node-route-angle-threshold", type=float, default=55.0)
+    parser.add_argument("--node-route-support-weight", type=float, default=0.45)
+    parser.add_argument("--node-route-max-pairs", type=int, default=3)
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)
