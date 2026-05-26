@@ -19,8 +19,8 @@ from PIL import Image, ImageDraw
 from quickdraw_dataset import (
     QuickDrawSample,
     arc_points,
-    detect_vector_corners,
     draw_line_mask,
+    angle_degrees,
     iter_raw_samples,
     normalize_strokes,
 )
@@ -39,6 +39,7 @@ LABEL_SCHEMA = {
         "tangent_valid_mask",
         "stroke_id_map",
     ],
+    "metadata_fields": ["vector_strokes", "closed_stroke_ids"],
 }
 
 
@@ -72,6 +73,71 @@ def draw_centreline_mask(strokes: list[np.ndarray], image_size: int) -> np.ndarr
         if len(stroke) >= 2:
             draw.line([tuple(point) for point in stroke], fill=1, width=1)
     return np.asarray(image, dtype=np.uint8).astype(bool)
+
+
+def is_closed_stroke(stroke: np.ndarray, tolerance_px: float = 2.5) -> bool:
+    return len(stroke) >= 3 and float(np.linalg.norm(stroke[0] - stroke[-1])) <= tolerance_px
+
+
+def unique_closed_points(stroke: np.ndarray) -> np.ndarray:
+    if is_closed_stroke(stroke):
+        return stroke[:-1]
+    return stroke
+
+
+def add_unique_point(points: list[np.ndarray], point: np.ndarray, min_distance_px: float = 2.0) -> None:
+    if not any(float(np.linalg.norm(point - existing)) < min_distance_px for existing in points):
+        points.append(point.astype(np.float32))
+
+
+def detect_structural_corners(
+    stroke: np.ndarray,
+    angle_threshold_deg: float = 135.0,
+    stride: int = 2,
+) -> list[np.ndarray]:
+    """Detect sharp vector turns, including sparse polygon vertices.
+
+    The older stride-only detector missed triangles/squares because those
+    strokes can contain only vertices. This version always evaluates direct
+    neighboring vector segments first, then adds a stride-based pass for denser
+    hand-drawn strokes.
+    """
+    if len(stroke) < 3:
+        return []
+
+    corners: list[np.ndarray] = []
+    closed = is_closed_stroke(stroke)
+    points = unique_closed_points(stroke)
+    if len(points) < 3:
+        return []
+
+    if closed:
+        candidate_indices = range(len(points))
+    else:
+        candidate_indices = range(1, len(points) - 1)
+
+    for index in candidate_indices:
+        prev_point = points[(index - 1) % len(points)]
+        point = points[index]
+        next_point = points[(index + 1) % len(points)]
+        angle = angle_degrees(prev_point, point, next_point)
+        if angle is not None and angle <= angle_threshold_deg:
+            add_unique_point(corners, point)
+
+    if len(points) >= (2 * stride + 1):
+        if closed:
+            stride_indices = range(len(points))
+        else:
+            stride_indices = range(stride, len(points) - stride)
+        for index in stride_indices:
+            prev_point = points[(index - stride) % len(points)]
+            point = points[index]
+            next_point = points[(index + stride) % len(points)]
+            angle = angle_degrees(prev_point, point, next_point)
+            if angle is not None and angle <= angle_threshold_deg:
+                add_unique_point(corners, point)
+
+    return corners
 
 
 def dense_stroke_samples(strokes: list[np.ndarray], step_px: float = 0.5) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -199,13 +265,16 @@ def render_rich_labels(
 
     endpoint_points: list[np.ndarray] = []
     corner_points: list[np.ndarray] = []
-    for stroke in strokes:
+    closed_stroke_ids: list[int] = []
+    for stroke_id, stroke in enumerate(strokes):
         if len(stroke) < 2:
             continue
-        endpoint_points.extend([stroke[0], stroke[-1]])
-        for corner in detect_vector_corners(stroke, angle_threshold_deg=corner_angle_threshold_deg, stride=corner_stride):
-            if not any(float(np.linalg.norm(corner - existing)) < 2.0 for existing in corner_points):
-                corner_points.append(corner)
+        if is_closed_stroke(stroke):
+            closed_stroke_ids.append(stroke_id)
+        else:
+            endpoint_points.extend([stroke[0], stroke[-1]])
+        for corner in detect_structural_corners(stroke, angle_threshold_deg=corner_angle_threshold_deg, stride=corner_stride):
+            add_unique_point(corner_points, corner)
 
     junction_points = detect_intersections(strokes)
     for point in endpoint_points:
@@ -241,6 +310,9 @@ def render_rich_labels(
         "corner_count": len(corner_points),
         "junction_count": len(junction_points),
         "stroke_count": len(strokes),
+        "closed_stroke_count": len(closed_stroke_ids),
+        "closed_stroke_ids": closed_stroke_ids,
+        "vector_strokes": [[[float(x), float(y)] for x, y in stroke.tolist()] for stroke in strokes],
     }
     return image, labels, meta
 

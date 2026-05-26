@@ -25,6 +25,7 @@ uses QuickDraw vector strokes to create:
 - tangent direction fields, `tangent_cos` and `tangent_sin`
 - tangent valid mask
 - stroke id map for inspectable same-stroke metadata
+- normalized vector stroke metadata and closed-stroke ids for oracle tests
 
 This gives reconstruction explicit hints for Arduino plotting: where to start,
 where to split, where to preserve sharp turns, and which local direction to
@@ -53,8 +54,9 @@ python src/quickdraw_rich_labels.py \
 
 The synthetic set includes simple line, square, triangle, circle/loop,
 T-junction, X-crossing, smooth bend, close parallel curves, and a simplified
-cat-tail/ground-contact case. Outputs are `.npy` arrays plus preview PNGs under
-`previews/`.
+cat-tail/ground-contact case. Sparse polygon vertices are labelled as corners,
+closed strokes are not labelled as endpoints, and outputs are `.npy` arrays
+plus preview PNGs under `previews/`.
 
 For real QuickDraw data already placed under `data/quickdraw/raw/`:
 
@@ -105,8 +107,30 @@ python src/oracle_stroke_structure_reconstruction.py \
   --max-samples 3
 ```
 
-If this fails, the label/decoder design is the problem. If it works, training a
-model to predict these labels is justified.
+By default, oracle mode uses generated same-stroke continuity metadata. This is
+the upper-bound test for the label design: simple closed shapes should stay
+continuous instead of being split into pen-up fragments. If this fails, the
+label/decoder design is the problem. If it works, training a model to predict
+the visible heads is justified.
+
+For a stricter raster-only decoder stress test, disable continuity metadata:
+
+```bash
+python src/oracle_stroke_structure_reconstruction.py \
+  --processed-dir data/quickdraw/rich_smoke \
+  --output-dir output/oracle_structure_smoke_raster_only \
+  --max-samples 3 \
+  --no-oracle-continuity-metadata
+```
+
+Use both results together:
+
+- continuity-aware oracle checks whether generated labels preserve true stroke
+  order and closed-loop continuity
+- raster-only oracle checks how much continuity the graph decoder can recover
+  without hidden metadata
+- ML reconstruction is expected to underperform both until the model predicts
+  stable centreline, endpoint, corner, junction, and tangent fields
 
 Oracle outputs include `arduino_commands.txt`, `stroke_metrics.json`,
 `structure_label_overlay.png`, `reconstruction_debug.png`,
@@ -140,7 +164,8 @@ Both oracle and ML reconstruction report command count, stroke count, average
 and median points per stroke, pen-up travel distance, pen-down drawing distance,
 total movement distance, estimated plotting time, bounds validation status,
 support coverage, endpoint/corner/junction counts, traced endpoint usage,
-untraced support fraction, tangent consistency, model path, and label schema.
+untraced support fraction, tangent consistency, whether oracle continuity
+metadata was used, model path, and label schema.
 
 ## Recommended Next Run
 

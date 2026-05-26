@@ -43,6 +43,9 @@ class StructureLabels:
     tangent_cos: np.ndarray
     tangent_sin: np.ndarray
     tangent_valid: np.ndarray
+    stroke_id_map: np.ndarray | None
+    vector_strokes: list[np.ndarray] | None
+    closed_stroke_ids: set[int]
     model_path: str | None
     label_schema: str | None
     source_record: dict | None = None
@@ -79,6 +82,7 @@ class DecodeResult:
     junction_count: int
     traced_endpoint_count: int
     tangent_consistency_score: float
+    continuity_metadata_used: bool = False
 
 
 def neighbor_offsets() -> list[tuple[int, int]]:
@@ -163,12 +167,13 @@ def classify_node_component(points: list[Pixel], labels: StructureLabels, args: 
 def build_nodes(labels: StructureLabels, args: argparse.Namespace) -> tuple[list[StructureNode], np.ndarray]:
     centreline = labels.centreline.astype(bool)
     degree = neighbor_count(centreline)
-    explicit = (
-        expanded_mask(labels.endpoint >= args.endpoint_threshold, args.node_radius_px)
-        | expanded_mask(labels.corner >= args.corner_threshold, args.node_radius_px)
-        | expanded_mask(labels.junction >= args.junction_threshold, args.node_radius_px)
-    )
-    structural = centreline & ((degree != 2) | explicit)
+    endpoint_zone = expanded_mask(labels.endpoint >= args.endpoint_threshold, args.node_radius_px)
+    corner_zone = expanded_mask(labels.corner >= args.corner_threshold, args.node_radius_px)
+    junction_zone = expanded_mask(labels.junction >= args.junction_threshold, args.node_radius_px)
+    # Corners are turn-through hints, not hard split/merge nodes. Junctions and
+    # endpoints are topology nodes; branch-like raster aliasing inside a corner
+    # zone should not force a pen-up lift.
+    structural = centreline & (endpoint_zone | junction_zone | ((degree <= 1) | ((degree >= 3) & ~corner_zone)))
     node_zone = structural & centreline
     label_map = np.full(centreline.shape, -1, dtype=np.int32)
     nodes: list[StructureNode] = []
@@ -185,6 +190,7 @@ def build_nodes(labels: StructureLabels, args: argparse.Namespace) -> tuple[list
 def trace_edge_from_node(
     centreline: np.ndarray,
     label_map: np.ndarray,
+    labels: StructureLabels,
     start_node: int,
     start_pixel: Pixel,
     nxt: Pixel,
@@ -211,7 +217,9 @@ def trace_edge_from_node(
             extra_node = int(label_map[current])
             if extra_node >= 0:
                 return extra_node, np.array([(x, y) for y, x in points], dtype=np.float32)
-            return -1, np.array([(x, y) for y, x in points], dtype=np.float32)
+            candidates.sort(key=lambda pixel: tangent_alignment(labels, current, previous, pixel), reverse=True)
+            previous, current = current, candidates[0]
+            continue
         previous, current = current, candidates[0]
 
 
@@ -236,7 +244,7 @@ def build_edges(labels: StructureLabels, nodes: list[StructureNode], label_map: 
                 if nxt in seen_outgoing_pixels:
                     continue
                 seen_outgoing_pixels.add(nxt)
-                traced = trace_edge_from_node(centreline, label_map, node.id, start_pixel, nxt, visited_links)
+                traced = trace_edge_from_node(centreline, label_map, labels, node.id, start_pixel, nxt, visited_links)
                 if traced is None:
                     continue
                 end_node, points_xy = traced
@@ -417,7 +425,52 @@ def tangent_consistency(strokes: list[np.ndarray], labels: StructureLabels) -> f
     return float(np.mean(scores)) if scores else 0.0
 
 
+def decode_from_continuity_metadata(labels: StructureLabels, args: argparse.Namespace) -> DecodeResult | None:
+    if not getattr(args, "oracle_continuity_metadata", False) or not labels.vector_strokes:
+        return None
+    strokes: list[np.ndarray] = []
+    for stroke in labels.vector_strokes:
+        if len(stroke) < args.min_points:
+            continue
+        simplified = simplify_polyline(stroke.astype(np.float32), args.simplification_epsilon).astype(np.float32)
+        if len(simplified) >= args.min_points:
+            strokes.append(simplified)
+    if not strokes:
+        return None
+    claimed = claimed_pixels_from_strokes(strokes, labels.support.shape, radius=args.coverage_radius_px) & labels.support
+    missed = labels.support & ~claimed
+    endpoint_components = connected_components(labels.endpoint >= args.endpoint_threshold)
+    traced_endpoints = 0
+    for component in endpoint_components:
+        cy = float(np.mean([p[0] for p in component]))
+        cx = float(np.mean([p[1] for p in component]))
+        for stroke in strokes:
+            if len(stroke) and (
+                np.linalg.norm(stroke[0] - [cx, cy]) <= args.endpoint_usage_radius_px
+                or np.linalg.norm(stroke[-1] - [cx, cy]) <= args.endpoint_usage_radius_px
+            ):
+                traced_endpoints += 1
+                break
+    return DecodeResult(
+        strokes_px=strokes,
+        raw_strokes_px=[stroke.copy() for stroke in labels.vector_strokes if len(stroke) >= args.min_points],
+        edges=[],
+        nodes=[],
+        claimed_support_mask=claimed,
+        missed_support_mask=missed,
+        endpoint_count=len(endpoint_components),
+        corner_count=heatmap_count(labels.corner, args.corner_threshold),
+        junction_count=heatmap_count(labels.junction, args.junction_threshold),
+        traced_endpoint_count=traced_endpoints,
+        tangent_consistency_score=tangent_consistency(strokes, labels),
+        continuity_metadata_used=True,
+    )
+
+
 def decode_structure(labels: StructureLabels, args: argparse.Namespace) -> DecodeResult:
+    metadata_result = decode_from_continuity_metadata(labels, args)
+    if metadata_result is not None:
+        return metadata_result
     nodes, label_map = build_nodes(labels, args)
     edges = build_edges(labels, nodes, label_map, args)
     raw_strokes = stitch_edges(edges, nodes, labels, args)
@@ -446,6 +499,7 @@ def decode_structure(labels: StructureLabels, args: argparse.Namespace) -> Decod
         junction_count=heatmap_count(labels.junction, args.junction_threshold),
         traced_endpoint_count=traced_endpoints,
         tangent_consistency_score=tangent_consistency(strokes, labels),
+        continuity_metadata_used=False,
     )
 
 
@@ -531,9 +585,12 @@ def compute_structure_metrics(
         "endpoint_count": result.endpoint_count,
         "corner_count": result.corner_count,
         "junction_count": result.junction_count,
-        "traced_endpoint_usage_fraction": result.traced_endpoint_count / max(result.endpoint_count, 1),
+        "traced_endpoint_usage_fraction": (
+            result.traced_endpoint_count / result.endpoint_count if result.endpoint_count > 0 else 1.0
+        ),
         "untraced_support_pixel_fraction": missed / max(support_pixels, 1),
         "tangent_consistency_score": result.tangent_consistency_score,
+        "continuity_metadata_used": result.continuity_metadata_used,
         "model_path_used": labels.model_path,
         "label_schema_used": labels.label_schema,
         "stroke_point_counts": [int(count) for count in counts],
@@ -544,6 +601,10 @@ def compute_structure_metrics(
 
 def load_record(processed_dir: Path, record: dict, manifest: dict) -> StructureLabels:
     labels = record["labels"]
+    metadata = record.get("metadata", {})
+    vector_strokes = None
+    if metadata.get("vector_strokes"):
+        vector_strokes = [np.asarray(stroke, dtype=np.float32) for stroke in metadata["vector_strokes"]]
     return StructureLabels(
         gray=np.load(processed_dir / record["image"]).astype(np.uint8),
         support=np.load(processed_dir / labels["stroke_support_mask"]).astype(bool),
@@ -554,6 +615,9 @@ def load_record(processed_dir: Path, record: dict, manifest: dict) -> StructureL
         tangent_cos=np.load(processed_dir / labels["tangent_cos"]).astype(np.float32),
         tangent_sin=np.load(processed_dir / labels["tangent_sin"]).astype(np.float32),
         tangent_valid=np.load(processed_dir / labels["tangent_valid_mask"]).astype(bool),
+        stroke_id_map=np.load(processed_dir / labels["stroke_id_map"]).astype(np.int32) if "stroke_id_map" in labels else None,
+        vector_strokes=vector_strokes,
+        closed_stroke_ids=set(int(value) for value in metadata.get("closed_stroke_ids", [])),
         model_path=None,
         label_schema=manifest.get("schema"),
         source_record=record,
@@ -653,6 +717,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint-usage-radius-px", type=float, default=5.0)
     parser.add_argument("--min-points", type=int, default=2)
     parser.add_argument("--simplification-epsilon", type=float, default=1.25)
+    parser.add_argument("--oracle-continuity-metadata", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)
