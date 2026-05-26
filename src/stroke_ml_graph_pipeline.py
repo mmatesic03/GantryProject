@@ -91,6 +91,33 @@ class MLGraphEdge:
     coverage_gain_pixels: int = 0
     coverage_overlap_fraction: float = 0.0
     rejected_by_vertex_passthrough: bool = False
+    rejected_by_node_topology: bool = False
+    node_topology_reason: str = ""
+
+
+@dataclass
+class NodeBlobTopology:
+    id: int
+    class_name: str
+    confidence: float
+    area: int
+    centroid_x: float
+    centroid_y: float
+    weighted_centroid_x: float
+    weighted_centroid_y: float
+    bbox: tuple[int, int, int, int]
+    width: int
+    height: int
+    aspect_ratio: float
+    elongation: float
+    node_probability_mean: float
+    node_probability_max: float
+    local_line_probability_mean: float
+    local_line_probability_max: float
+    incident_line_component_count: int
+    incident_directions: list[tuple[float, float]]
+    incident_angles_deg: list[float]
+    points_yx: np.ndarray
 
 
 @dataclass
@@ -115,6 +142,8 @@ class MLGraphResult:
     claimed_line_pixel_count: int
     line_coverage_fraction: float
     unclaimed_line_pixel_count: int
+    node_topologies: list[NodeBlobTopology]
+    rejected_by_node_topology_count: int
 
 
 def load_torch_probabilities(image_path: Path, model_path: Path) -> MLProbabilities:
@@ -422,6 +451,190 @@ def add_line_component_anchor_vertices(
     return augmented, added
 
 
+def expanded_mask(mask: np.ndarray, radius_px: int) -> np.ndarray:
+    if radius_px <= 0:
+        return mask.astype(bool).copy()
+    height, width = mask.shape
+    ys, xs = np.nonzero(mask)
+    output = np.zeros_like(mask, dtype=bool)
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        y0 = max(0, y - radius_px)
+        y1 = min(height, y + radius_px + 1)
+        x0 = max(0, x - radius_px)
+        x1 = min(width, x + radius_px + 1)
+        output[y0:y1, x0:x1] = True
+    return output
+
+
+def angle_between_vectors_deg(a: np.ndarray, b: np.ndarray, undirected: bool = True) -> float:
+    norm_a = float(np.linalg.norm(a))
+    norm_b = float(np.linalg.norm(b))
+    if norm_a <= 1e-9 or norm_b <= 1e-9:
+        return 180.0
+    dot = float(np.clip(np.dot(a / norm_a, b / norm_b), -1.0, 1.0))
+    angle = math.degrees(math.acos(dot))
+    if undirected:
+        angle = min(angle, 180.0 - angle)
+    return angle
+
+
+def direction_matches_blob(direction: np.ndarray, blob: NodeBlobTopology, max_angle_deg: float) -> bool:
+    if not blob.incident_directions:
+        return blob.class_name in {"line_like_node_fragment", "noisy_blob"}
+    return any(
+        angle_between_vectors_deg(direction, np.array(blob_direction, dtype=np.float32), undirected=True) <= max_angle_deg
+        for blob_direction in blob.incident_directions
+    )
+
+
+def classify_node_blob(
+    area: int,
+    aspect_ratio: float,
+    incident_count: int,
+    incident_angles: list[float],
+    args: argparse.Namespace,
+) -> tuple[str, float]:
+    if area < args.node_blob_min_area:
+        return "noisy_blob", 0.35
+    if aspect_ratio >= args.line_like_node_aspect_threshold and incident_count <= 2:
+        return "line_like_node_fragment", 0.70
+    if incident_count <= 0:
+        return "noisy_blob", 0.30
+    if incident_count == 1:
+        return "endpoint", 0.75
+    if incident_count == 2:
+        angle = incident_angles[0] if incident_angles else 180.0
+        if angle >= args.node_topology_angle_threshold:
+            return "smooth_bend", 0.65
+        return "sharp_corner", 0.75
+    if incident_count == 3:
+        return "t_junction", 0.70
+    if incident_count >= 4:
+        if incident_count > args.max_node_blob_degree:
+            return "multi_junction", 0.45
+        if incident_angles and max(incident_angles) >= args.node_topology_angle_threshold:
+            return "crossing_or_overlap", 0.65
+        return "multi_junction", 0.60
+    return "noisy_blob", 0.25
+
+
+def analyze_node_topologies(
+    node_prob: np.ndarray,
+    line_prob: np.ndarray,
+    node_mask: np.ndarray,
+    line_mask: np.ndarray,
+    args: argparse.Namespace,
+) -> list[NodeBlobTopology]:
+    topologies: list[NodeBlobTopology] = []
+    height, width = node_mask.shape
+    for component_id, component in enumerate(connected_components(node_mask, connectivity=8)):
+        points_yx = np.array(component, dtype=np.int32)
+        area = int(len(points_yx))
+        if area <= 0:
+            continue
+        ys = points_yx[:, 0]
+        xs = points_yx[:, 1]
+        y0 = int(np.min(ys))
+        y1 = int(np.max(ys))
+        x0 = int(np.min(xs))
+        x1 = int(np.max(xs))
+        bbox_w = x1 - x0 + 1
+        bbox_h = y1 - y0 + 1
+        aspect_ratio = max(bbox_w, bbox_h) / max(min(bbox_w, bbox_h), 1)
+        values = node_prob[ys, xs]
+        centroid_y = float(np.mean(ys))
+        centroid_x = float(np.mean(xs))
+        weighted_x, weighted_y = weighted_centroid(points_yx, node_prob)
+
+        radius = int(args.node_incident_radius_px)
+        ly0 = max(0, y0 - radius)
+        ly1 = min(height, y1 + radius + 1)
+        lx0 = max(0, x0 - radius)
+        lx1 = min(width, x1 + radius + 1)
+        local_line_prob = line_prob[ly0:ly1, lx0:lx1]
+        local_line_mask = line_mask[ly0:ly1, lx0:lx1]
+        incident_directions: list[tuple[float, float]] = []
+        incident_count = 0
+        for line_component in connected_components(local_line_mask, connectivity=8):
+            local_points = np.array(line_component, dtype=np.int32)
+            if len(local_points) == 0:
+                continue
+            global_points = local_points + np.array([ly0, lx0], dtype=np.int32)
+            distances = np.sqrt((global_points[:, 1] - weighted_x) ** 2 + (global_points[:, 0] - weighted_y) ** 2)
+            if float(np.min(distances)) > args.node_incident_radius_px:
+                continue
+            incident_count += 1
+            near_count = min(8, len(global_points))
+            near_points = global_points[np.argsort(distances)[:near_count]]
+            mean_y = float(np.mean(near_points[:, 0]))
+            mean_x = float(np.mean(near_points[:, 1]))
+            direction = np.array([mean_x - weighted_x, mean_y - weighted_y], dtype=np.float32)
+            norm = float(np.linalg.norm(direction))
+            if norm > 1e-9:
+                unit = direction / norm
+                # Merge directions that are already represented in this blob.
+                if all(angle_between_vectors_deg(unit, np.array(existing), undirected=True) > args.node_direction_bin_degrees for existing in incident_directions):
+                    incident_directions.append((float(unit[0]), float(unit[1])))
+
+        incident_angles: list[float] = []
+        for i in range(len(incident_directions)):
+            for j in range(i + 1, len(incident_directions)):
+                incident_angles.append(
+                    angle_between_vectors_deg(
+                        np.array(incident_directions[i], dtype=np.float32),
+                        np.array(incident_directions[j], dtype=np.float32),
+                        undirected=False,
+                    )
+                )
+        class_name, confidence = classify_node_blob(area, aspect_ratio, len(incident_directions), incident_angles, args)
+        topologies.append(
+            NodeBlobTopology(
+                id=component_id,
+                class_name=class_name,
+                confidence=confidence,
+                area=area,
+                centroid_x=centroid_x,
+                centroid_y=centroid_y,
+                weighted_centroid_x=float(weighted_x),
+                weighted_centroid_y=float(weighted_y),
+                bbox=(x0, y0, x1, y1),
+                width=bbox_w,
+                height=bbox_h,
+                aspect_ratio=float(aspect_ratio),
+                elongation=float(aspect_ratio),
+                node_probability_mean=float(np.mean(values)),
+                node_probability_max=float(np.max(values)),
+                local_line_probability_mean=float(np.mean(local_line_prob)) if local_line_prob.size else 0.0,
+                local_line_probability_max=float(np.max(local_line_prob)) if local_line_prob.size else 0.0,
+                incident_line_component_count=int(incident_count),
+                incident_directions=incident_directions,
+                incident_angles_deg=[float(angle) for angle in incident_angles],
+                points_yx=points_yx,
+            )
+        )
+    return topologies
+
+
+def node_support_probability_field(
+    line_prob: np.ndarray,
+    node_prob: np.ndarray,
+    node_topologies: list[NodeBlobTopology],
+    args: argparse.Namespace,
+) -> np.ndarray:
+    if not args.enable_node_topology or args.node_support_weight <= 0:
+        return line_prob
+    support = line_prob.copy()
+    local_node_mask = np.zeros_like(line_prob, dtype=bool)
+    for blob in node_topologies:
+        if blob.class_name == "noisy_blob":
+            continue
+        local_node_mask[blob.points_yx[:, 0], blob.points_yx[:, 1]] = True
+    local_node_mask = expanded_mask(local_node_mask, int(args.node_support_radius_px))
+    boosted = np.clip(line_prob + args.node_support_weight * node_prob, 0.0, 1.0)
+    support[local_node_mask] = np.maximum(support[local_node_mask], boosted[local_node_mask])
+    return support
+
+
 def sample_edge_polyline(p0: tuple[float, float], p1: tuple[float, float], step_px: float) -> np.ndarray:
     x0, y0 = p0
     x1, y1 = p1
@@ -563,6 +776,7 @@ def astar_probability_path(
 
 def score_edge_path(
     line_prob: np.ndarray,
+    path_prob: np.ndarray,
     p0: tuple[float, float],
     p1: tuple[float, float],
     args: argparse.Namespace,
@@ -586,7 +800,7 @@ def score_edge_path(
     total_path_cost = float("inf")
     if use_path:
         path_polyline, total_path_cost, path_found = astar_probability_path(
-            line_prob,
+            path_prob,
             p0,
             p1,
             margin_px=args.path_corridor_margin_px,
@@ -654,6 +868,52 @@ def path_passes_near_other_vertex(
         if float(np.min(dx * dx + dy * dy)) <= radius_sq:
             return True
     return False
+
+
+def edge_node_topology_conflict(
+    polyline: np.ndarray,
+    node_topologies: list[NodeBlobTopology],
+    vertices: list[MLGraphVertex],
+    u: int,
+    v: int,
+    args: argparse.Namespace,
+) -> tuple[bool, str]:
+    if not args.enable_node_topology or len(polyline) < 2:
+        return False, ""
+
+    start = np.array([vertices[u].x, vertices[u].y], dtype=np.float32)
+    end = np.array([vertices[v].x, vertices[v].y], dtype=np.float32)
+    for blob in node_topologies:
+        center = np.array([blob.weighted_centroid_x, blob.weighted_centroid_y], dtype=np.float32)
+        distances = np.linalg.norm(polyline.astype(np.float32) - center[None, :], axis=1)
+        nearest_i = int(np.argmin(distances))
+        if float(distances[nearest_i]) > args.node_support_radius_px:
+            continue
+
+        is_endpoint_blob = (
+            float(np.linalg.norm(start - center)) <= args.node_support_radius_px * 1.5
+            or float(np.linalg.norm(end - center)) <= args.node_support_radius_px * 1.5
+        )
+        if blob.class_name == "noisy_blob":
+            return True, f"edge crosses noisy node blob {blob.id}"
+        if blob.class_name == "endpoint" and not is_endpoint_blob:
+            return True, f"edge passes through endpoint blob {blob.id}"
+
+        lo = max(0, nearest_i - 3)
+        hi = min(len(polyline) - 1, nearest_i + 3)
+        direction = polyline[hi].astype(np.float32) - polyline[lo].astype(np.float32)
+        if float(np.linalg.norm(direction)) <= 1e-9:
+            continue
+        if not direction_matches_blob(direction, blob, args.node_topology_angle_threshold):
+            return True, f"edge direction inconsistent with {blob.class_name} blob {blob.id}"
+
+        if blob.class_name in {"line_like_node_fragment", "crossing_or_overlap"} and not is_endpoint_blob:
+            # These regions are useful local support, but they should not become
+            # broad bridges between unrelated strokes unless an edge terminates
+            # at the blob or clearly follows one of its detected directions.
+            if blob.confidence < 0.75:
+                return True, f"edge cuts through ambiguous {blob.class_name} blob {blob.id}"
+    return False, ""
 
 
 def supported_path_pixels(edge: MLGraphEdge, line_prob: np.ndarray, line_threshold: float, radius_px: int) -> set[tuple[int, int]]:
@@ -751,10 +1011,12 @@ def prune_edges_by_degree_and_coverage(
 def build_candidate_edges(
     vertices: list[MLGraphVertex],
     line_prob: np.ndarray,
+    path_prob: np.ndarray,
     line_mask: np.ndarray,
     line_components: list[np.ndarray],
+    node_topologies: list[NodeBlobTopology],
     args: argparse.Namespace,
-) -> tuple[list[MLGraphEdge], list[MLGraphEdge], list[MLGraphEdge], int, int, int, int, int, int, float, int]:
+) -> tuple[list[MLGraphEdge], list[MLGraphEdge], list[MLGraphEdge], int, int, int, int, int, int, int, float, int]:
     pairs: set[tuple[int, int]] = set()
     coords = np.array([[vertex.x, vertex.y] for vertex in vertices], dtype=np.float32)
 
@@ -813,13 +1075,21 @@ def build_candidate_edges(
     for u, v in sorted(pairs):
         p0 = (vertices[u].x, vertices[u].y)
         p1 = (vertices[v].x, vertices[v].y)
-        path_metrics = score_edge_path(line_prob, p0, p1, args)
+        path_metrics = score_edge_path(line_prob, path_prob, p0, p1, args)
         passes_other_vertex = path_passes_near_other_vertex(
             path_metrics["polyline"],
             vertices,
             u,
             v,
             args.vertex_passthrough_radius_px,
+        )
+        node_conflict, node_conflict_reason = edge_node_topology_conflict(
+            path_metrics["polyline"],
+            node_topologies,
+            vertices,
+            u,
+            v,
+            args,
         )
         accepted = bool(
             path_metrics["path_found"]
@@ -829,10 +1099,13 @@ def build_candidate_edges(
             and path_metrics["length_ratio"] <= args.max_path_to_straight_ratio
             and path_metrics["total_path_cost"] <= args.path_cost_threshold
             and not passes_other_vertex
+            and not node_conflict
         )
         reason = "accepted" if accepted else "score/support below threshold"
         if not path_metrics["path_found"]:
             reason = "no low-cost probability path found"
+        elif node_conflict:
+            reason = node_conflict_reason
         elif passes_other_vertex:
             reason = "path passes through another graph vertex"
         elif path_metrics["length_ratio"] > args.max_path_to_straight_ratio:
@@ -863,6 +1136,8 @@ def build_candidate_edges(
             search_mode=args.edge_search_mode,
             accepted_before_pruning=accepted,
             rejected_by_vertex_passthrough=passes_other_vertex,
+            rejected_by_node_topology=node_conflict,
+            node_topology_reason=node_conflict_reason,
         )
         candidate_edges.append(edge)
         if accepted:
@@ -884,6 +1159,7 @@ def build_candidate_edges(
         rejected_by_degree,
         rejected_by_coverage,
         rejected_by_vertex_passthrough,
+        sum(1 for edge in candidate_edges if edge.rejected_by_node_topology),
         line_component_pair_count,
         claimed_line_pixels,
         line_coverage_fraction,
@@ -973,6 +1249,14 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         max_vertices=args.max_vertices,
     )
     line_mask = probabilities.line_prob >= args.line_threshold
+    node_topologies = analyze_node_topologies(
+        probabilities.node_prob,
+        probabilities.line_prob,
+        node_mask,
+        line_mask,
+        args,
+    )
+    path_prob = node_support_probability_field(probabilities.line_prob, probabilities.node_prob, node_topologies, args)
     line_components = [
         np.array(component, dtype=np.int32)
         for component in connected_components(line_mask, connectivity=8)
@@ -1005,6 +1289,7 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         rejected_by_degree,
         rejected_by_coverage,
         rejected_by_vertex_passthrough,
+        rejected_by_node_topology,
         line_component_pair_count,
         claimed_line_pixels,
         line_coverage_fraction,
@@ -1012,8 +1297,10 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
     ) = build_candidate_edges(
         vertices,
         probabilities.line_prob,
+        path_prob,
         line_mask,
         line_components,
+        node_topologies,
         args,
     )
     strokes = extract_recursive_strokes(vertices, accepted_edges)
@@ -1038,6 +1325,8 @@ def build_ml_graph(probabilities: MLProbabilities, args: argparse.Namespace) -> 
         claimed_line_pixel_count=claimed_line_pixels,
         line_coverage_fraction=line_coverage_fraction,
         unclaimed_line_pixel_count=unclaimed_line_pixels,
+        node_topologies=node_topologies,
+        rejected_by_node_topology_count=rejected_by_node_topology,
     )
 
 
@@ -1120,6 +1409,11 @@ def compute_metrics(
         vertex_degree[edge.u] = vertex_degree.get(edge.u, 0) + 1
         vertex_degree[edge.v] = vertex_degree.get(edge.v, 0) + 1
     degree_values = list(vertex_degree.values())
+    node_class_counts: dict[str, int] = {}
+    incident_counts = []
+    for blob in graph.node_topologies:
+        node_class_counts[blob.class_name] = node_class_counts.get(blob.class_name, 0) + 1
+        incident_counts.append(len(blob.incident_directions))
     warnings = []
     if not graph.vertices:
         warnings.append("No ML node/corner components became graph vertices.")
@@ -1179,6 +1473,7 @@ def compute_metrics(
             "rejected_by_degree_pruning_count": graph.rejected_by_degree_pruning_count,
             "rejected_by_coverage_pruning_count": graph.rejected_by_coverage_pruning_count,
             "rejected_by_vertex_passthrough_count": graph.rejected_by_vertex_passthrough_count,
+            "rejected_by_node_topology_count": graph.rejected_by_node_topology_count,
             "node_mask_pixel_count": int(np.count_nonzero(graph.node_mask)),
             "line_mask_pixel_count": int(np.count_nonzero(graph.line_mask)),
             "claimed_line_pixel_count": graph.claimed_line_pixel_count,
@@ -1202,6 +1497,18 @@ def compute_metrics(
             "edge_coverage_overlap_fraction_mean": float(np.mean([edge.coverage_overlap_fraction for edge in graph.accepted_edges]))
             if graph.accepted_edges
             else 0.0,
+            "node_blob_count": len(graph.node_topologies),
+            "node_blob_class_counts": node_class_counts,
+            "endpoint_blob_count": node_class_counts.get("endpoint", 0),
+            "sharp_corner_blob_count": node_class_counts.get("sharp_corner", 0),
+            "smooth_bend_blob_count": node_class_counts.get("smooth_bend", 0),
+            "t_junction_blob_count": node_class_counts.get("t_junction", 0),
+            "crossing_or_overlap_blob_count": node_class_counts.get("crossing_or_overlap", 0),
+            "multi_junction_blob_count": node_class_counts.get("multi_junction", 0),
+            "line_like_node_fragment_count": node_class_counts.get("line_like_node_fragment", 0),
+            "noisy_or_ambiguous_blob_count": node_class_counts.get("noisy_blob", 0),
+            "average_incident_direction_count": float(np.mean(incident_counts)) if incident_counts else 0.0,
+            "max_incident_direction_count": int(max(incident_counts)) if incident_counts else 0,
         },
         "thresholds": {
             "node_threshold": args.node_threshold,
@@ -1230,6 +1537,15 @@ def compute_metrics(
             "add_line_component_anchors": args.add_line_component_anchors,
             "line_anchor_min_distance_px": args.line_anchor_min_distance_px,
             "max_line_anchors_per_component": args.max_line_anchors_per_component,
+            "enable_node_topology": args.enable_node_topology,
+            "node_blob_min_area": args.node_blob_min_area,
+            "node_incident_radius_px": args.node_incident_radius_px,
+            "node_direction_bin_degrees": args.node_direction_bin_degrees,
+            "node_support_weight": args.node_support_weight,
+            "node_support_radius_px": args.node_support_radius_px,
+            "max_node_blob_degree": args.max_node_blob_degree,
+            "node_topology_angle_threshold": args.node_topology_angle_threshold,
+            "line_like_node_aspect_threshold": args.line_like_node_aspect_threshold,
         },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
@@ -1317,6 +1633,8 @@ def save_edge_debug(probabilities: MLProbabilities, graph: MLGraphResult, output
             color = (30, 150, 90, 230)
         elif edge.rejected_by_vertex_passthrough:
             color = (160, 60, 210, 105)
+        elif edge.rejected_by_node_topology:
+            color = (30, 90, 230, 120)
         elif edge.reason == "rejected by low new line coverage":
             color = (245, 135, 20, 95)
         else:
@@ -1327,6 +1645,33 @@ def save_edge_debug(probabilities: MLProbabilities, graph: MLGraphResult, output
     for vertex in graph.vertices:
         draw.ellipse((vertex.x - 4, vertex.y - 4, vertex.x + 4, vertex.y + 4), fill=(255, 230, 0, 235), outline=(0, 0, 0, 235))
         draw.text((vertex.x + 5, vertex.y + 3), f"{vertex.id}/{degree.get(vertex.id, 0)}", fill=(0, 0, 0, 255))
+    Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
+
+
+def save_node_topology_debug(probabilities: MLProbabilities, graph: MLGraphResult, output_path: Path) -> None:
+    image = Image.fromarray(probabilities.gray, mode="L").convert("RGB")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    colors = {
+        "endpoint": (40, 120, 255, 190),
+        "sharp_corner": (230, 60, 60, 190),
+        "smooth_bend": (30, 170, 90, 190),
+        "t_junction": (245, 160, 20, 190),
+        "crossing_or_overlap": (160, 70, 220, 190),
+        "multi_junction": (0, 160, 180, 190),
+        "line_like_node_fragment": (220, 80, 170, 190),
+        "noisy_blob": (130, 130, 130, 150),
+    }
+    for blob in graph.node_topologies:
+        color = colors.get(blob.class_name, (0, 0, 0, 160))
+        for y, x in blob.points_yx:
+            draw.point((int(x), int(y)), fill=color)
+        cx = float(blob.weighted_centroid_x)
+        cy = float(blob.weighted_centroid_y)
+        draw.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=(0, 0, 0, 230))
+        for dx, dy in blob.incident_directions:
+            draw.line((cx, cy, cx + dx * 16, cy + dy * 16), fill=(0, 0, 0, 210), width=2)
+        draw.text((cx + 5, cy + 3), f"{blob.id}:{blob.class_name}", fill=(0, 0, 0, 255))
     Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(output_path)
 
 
@@ -1381,6 +1726,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     save_json(metrics, output_dir / "stroke_metrics.json")
     save_probability_debug(probabilities, graph, output_dir / "ml_probability_debug.png")
     save_node_components_debug(probabilities, graph, output_dir / "node_components_debug.png")
+    save_node_topology_debug(probabilities, graph, output_dir / "node_topology_debug.png")
     save_edge_debug(probabilities, graph, output_dir / "candidate_edges_debug.png")
     save_edge_debug(probabilities, graph, output_dir / "graph_debug.png")
     save_strokes_debug(probabilities, graph, output_dir / "stroke_sequence_debug.png")
@@ -1446,6 +1792,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-line-component-anchors", dest="add_line_component_anchors", action="store_false")
     parser.add_argument("--line-anchor-min-distance-px", type=float, default=35.0)
     parser.add_argument("--max-line-anchors-per-component", type=int, default=4)
+    parser.add_argument("--enable-node-topology", action="store_true", help="Use topology-aware node/corner blob decoding.")
+    parser.add_argument("--disable-node-topology", dest="enable_node_topology", action="store_false")
+    parser.set_defaults(enable_node_topology=False)
+    parser.add_argument("--node-blob-min-area", type=int, default=3)
+    parser.add_argument("--node-incident-radius-px", type=float, default=18.0)
+    parser.add_argument("--node-direction-bin-degrees", type=float, default=22.5)
+    parser.add_argument("--node-support-weight", type=float, default=0.35)
+    parser.add_argument("--node-support-radius-px", type=float, default=10.0)
+    parser.add_argument("--max-node-blob-degree", type=int, default=4)
+    parser.add_argument("--node-topology-angle-threshold", type=float, default=135.0)
+    parser.add_argument("--line-like-node-aspect-threshold", type=float, default=2.8)
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)

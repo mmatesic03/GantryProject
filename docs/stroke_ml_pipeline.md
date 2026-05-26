@@ -201,6 +201,29 @@ Useful reconstruction tuning flags:
 --min-edge-new-coverage-fraction 0.30
 ```
 
+Topology-aware node/corner blob decoding is experimental and can be enabled
+when testing the ML-only graph path:
+
+```bash
+python src/stroke_ml_graph_pipeline.py \
+  --image input_images/cats.jpg \
+  --model-path models/stroke_unet_quickdraw_v1_best.pt \
+  --output-dir output/node_topology_cats \
+  --node-threshold 0.35 \
+  --line-threshold 0.35 \
+  --edge-score-threshold 0.18 \
+  --support-fraction-threshold 0.05 \
+  --edge-search-mode path \
+  --max-degree 3 \
+  --enable-node-topology
+```
+
+When enabled, node/corner components are classified as endpoints, corners,
+smooth bends, junctions, overlaps, line-like fragments, or noisy blobs. The
+pipeline saves `node_topology_debug.png` and records node blob class counts plus
+edge rejections caused by node-topology inconsistency. This avoids treating
+inflated node masks as a global `line OR node` path field.
+
 ## Tune ML Graph Parameters
 
 Manual tuning is slow because the best reconstruction settings depend on the
