@@ -269,13 +269,37 @@ python src/stroke_ml_reconstruction_pipeline.py \
   --node-threshold 0.35 \
   --support-threshold 0.30 \
   --node-support-weight 0.65 \
-  --centreline-mode thinning
+  --centreline-mode thinning \
+  --junction-cluster-radius-px 5 \
+  --smooth-join-angle-deg 38 \
+  --corner-join-angle-deg 125
 ```
 
 This pipeline writes `support_mask_debug.png`, `component_debug.png`,
 `centreline_debug.png`, `node_blob_debug.png`, `topology_debug.png`,
 `stroke_sequence_debug.png`, `gantry_path_preview.png`, `arduino_commands.txt`,
-and `stroke_metrics.json`.
+and `stroke_metrics.json`. The centreline stage clusters nearby branch pixels
+into junction zones, traces paths between those zones, joins smooth
+continuations, and rasterizes full stroke segments for coverage metrics.
+
+Tune the clean-slate reconstruction parameters with:
+
+```bash
+python src/tune_ml_reconstruction_parameters.py \
+  --image input_images/cats.jpg \
+  --model-path models/stroke_unet_quickdraw_v1_best.pt \
+  --output-dir output/ml_reconstruction_tuning_cats \
+  --target-source grayscale \
+  --max-runs 120 \
+  --top-k 8 \
+  --print-progress
+```
+
+The reconstruction tuner sweeps support thresholds, node support weight/radius,
+junction clustering, smooth/corner join angles, simplification epsilon, and
+minimum stroke length. It writes `tuning_results.json`, `tuning_results.csv`,
+`best_params.json`, `best_arduino_commands.txt`, `best_gantry_path_preview.png`,
+`best_overlay_preview.png`, and top-ranked preview/summary files.
 
 ## Tune ML Graph Parameters
 

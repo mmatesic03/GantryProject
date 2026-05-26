@@ -75,18 +75,41 @@ class NodeBlobInfo:
 
 
 @dataclass
+class CentrelineNode:
+    id: int
+    kind: str
+    x: float
+    y: float
+    pixels_yx: np.ndarray
+
+
+@dataclass
+class CentrelineEdge:
+    id: int
+    u: int
+    v: int
+    points_xy: np.ndarray
+    length_px: float
+    used: bool = False
+
+
+@dataclass
 class ReconstructionResult:
     line_mask: np.ndarray
     node_mask: np.ndarray
     support_prob: np.ndarray
     support_mask: np.ndarray
     centreline_mask: np.ndarray
+    junction_zone_mask: np.ndarray
     components: list[SupportComponent]
     node_blobs: list[NodeBlobInfo]
     raw_strokes_px: list[np.ndarray]
     strokes_px: list[np.ndarray]
     endpoint_count: int
     branch_count: int
+    junction_zone_count: int
+    centreline_edge_count: int
+    joined_stroke_count: int
     claimed_support_pixel_count: int
     support_coverage_fraction: float
     unclaimed_support_pixel_count: int
@@ -256,56 +279,301 @@ def edge_key(a: Pixel, b: Pixel) -> tuple[Pixel, Pixel]:
     return (a, b) if a <= b else (b, a)
 
 
-def trace_path_from(skeleton: np.ndarray, start: Pixel, nxt: Pixel, node_mask: np.ndarray, visited_links: set[tuple[Pixel, Pixel]]) -> list[Pixel]:
-    path = [start, nxt]
-    previous = start
+def representative_point(points_yx: np.ndarray) -> tuple[float, float]:
+    centroid = np.mean(points_yx.astype(np.float32), axis=0)
+    distances = np.sum((points_yx.astype(np.float32) - centroid[None, :]) ** 2, axis=1)
+    y, x = points_yx[int(np.argmin(distances))].tolist()
+    return float(x), float(y)
+
+
+def build_centreline_nodes(
+    skeleton: np.ndarray,
+    degree: np.ndarray,
+    junction_cluster_radius_px: int,
+) -> tuple[list[CentrelineNode], np.ndarray, int, int]:
+    label_map = np.full(skeleton.shape, -1, dtype=np.int32)
+    nodes: list[CentrelineNode] = []
+    branches = skeleton & (degree >= 3)
+    junction_zone_mask = expanded_mask(branches, junction_cluster_radius_px) & skeleton
+    for component in connected_components(junction_zone_mask, connectivity=8):
+        points = np.array(component, dtype=np.int32)
+        if len(points) == 0:
+            continue
+        x, y = representative_point(points)
+        node_id = len(nodes)
+        label_map[points[:, 0], points[:, 1]] = node_id
+        nodes.append(CentrelineNode(id=node_id, kind="junction_zone", x=x, y=y, pixels_yx=points))
+
+    endpoints = skeleton & (degree == 1) & (label_map < 0)
+    for y, x in np.argwhere(endpoints):
+        points = np.array([[int(y), int(x)]], dtype=np.int32)
+        node_id = len(nodes)
+        label_map[int(y), int(x)] = node_id
+        nodes.append(CentrelineNode(id=node_id, kind="endpoint", x=float(x), y=float(y), pixels_yx=points))
+
+    return nodes, label_map, int(np.count_nonzero(endpoints)), len([node for node in nodes if node.kind == "junction_zone"])
+
+
+def node_boundary_pixels(node: CentrelineNode, skeleton: np.ndarray, label_map: np.ndarray) -> list[Pixel]:
+    pixels: list[Pixel] = []
+    for y, x in node.pixels_yx.tolist():
+        pixel = (int(y), int(x))
+        if any(label_map[nbr] != node.id for nbr in pixel_neighbors(pixel, skeleton)):
+            pixels.append(pixel)
+    return pixels or [tuple(node.pixels_yx[0].tolist())]
+
+
+def trace_edge_from_node(
+    skeleton: np.ndarray,
+    label_map: np.ndarray,
+    nodes: list[CentrelineNode],
+    start_node: int,
+    start_pixel: Pixel,
+    nxt: Pixel,
+    visited_links: set[tuple[Pixel, Pixel]],
+) -> CentrelineEdge | None:
+    path_yx = [start_pixel, nxt]
+    previous = start_pixel
     current = nxt
-    visited_links.add(edge_key(start, nxt))
-    while True:
-        if node_mask[current] and current != start:
-            break
+    visited_links.add(edge_key(start_pixel, nxt))
+    end_node = int(label_map[current]) if label_map[current] >= 0 else -1
+    while end_node < 0:
         candidates = [pixel for pixel in pixel_neighbors(current, skeleton) if pixel != previous]
         unvisited = [pixel for pixel in candidates if edge_key(current, pixel) not in visited_links]
         if not unvisited:
             break
         if len(unvisited) > 1:
+            # This should normally be inside a clustered junction zone. If it is
+            # still outside, end the edge here rather than creating arbitrary
+            # forks from a single noisy pixel.
             break
         following = unvisited[0]
         visited_links.add(edge_key(current, following))
         previous, current = current, following
-        path.append(current)
-    return path
+        path_yx.append(current)
+        end_node = int(label_map[current]) if label_map[current] >= 0 else -1
+
+    if end_node < 0:
+        return None
+    start_rep = np.array([[nodes[start_node].x, nodes[start_node].y]], dtype=np.float32)
+    end_rep = np.array([[nodes[end_node].x, nodes[end_node].y]], dtype=np.float32)
+    middle = np.array([(x, y) for y, x in path_yx], dtype=np.float32)
+    points = np.vstack([start_rep, middle, end_rep])
+    if len(points) >= 3 and np.allclose(points[0], points[1]):
+        points = points[1:]
+    if len(points) >= 3 and np.allclose(points[-1], points[-2]):
+        points = points[:-1]
+    return CentrelineEdge(
+        id=-1,
+        u=start_node,
+        v=end_node,
+        points_xy=points,
+        length_px=path_length_px(points),
+    )
 
 
-def trace_centreline_paths(skeleton: np.ndarray, min_points: int, min_length_px: float) -> tuple[list[np.ndarray], int, int]:
-    degree = neighbor_count(skeleton)
-    endpoints = skeleton & (degree == 1)
-    branches = skeleton & (degree >= 3)
-    nodes = endpoints | branches
+def build_centreline_edges(
+    skeleton: np.ndarray,
+    label_map: np.ndarray,
+    nodes: list[CentrelineNode],
+    min_length_px: float,
+) -> list[CentrelineEdge]:
     visited_links: set[tuple[Pixel, Pixel]] = set()
-    paths: list[np.ndarray] = []
+    edges: list[CentrelineEdge] = []
+    seen_pairs: set[tuple[int, int, tuple[int, int], tuple[int, int]]] = set()
+    for node in nodes:
+        for start_pixel in node_boundary_pixels(node, skeleton, label_map):
+            for nxt in pixel_neighbors(start_pixel, skeleton):
+                if int(label_map[nxt]) == node.id:
+                    continue
+                if edge_key(start_pixel, nxt) in visited_links:
+                    continue
+                edge = trace_edge_from_node(skeleton, label_map, nodes, node.id, start_pixel, nxt, visited_links)
+                if edge is None or edge.length_px < min_length_px or edge.u == edge.v:
+                    continue
+                key = (
+                    min(edge.u, edge.v),
+                    max(edge.u, edge.v),
+                    tuple(np.round(edge.points_xy[0]).astype(int).tolist()),
+                    tuple(np.round(edge.points_xy[-1]).astype(int).tolist()),
+                )
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                edge.id = len(edges)
+                edges.append(edge)
+    return edges
 
-    node_pixels = [tuple(pixel.tolist()) for pixel in np.argwhere(nodes)]
-    for start in node_pixels:
-        for nxt in pixel_neighbors(start, skeleton):
-            if edge_key(start, nxt) in visited_links:
-                continue
-            path = trace_path_from(skeleton, start, nxt, nodes, visited_links)
-            array = np.array([(x, y) for y, x in path], dtype=np.float32)
-            if keep_path(array, min_points, min_length_px):
-                paths.append(array)
 
-    for y, x in np.argwhere(skeleton):
-        pixel = (int(y), int(x))
-        for nxt in pixel_neighbors(pixel, skeleton):
-            if edge_key(pixel, nxt) in visited_links:
-                continue
-            path = trace_path_from(skeleton, pixel, nxt, nodes, visited_links)
-            array = np.array([(x, y) for y, x in path], dtype=np.float32)
-            if keep_path(array, min_points, min_length_px):
-                paths.append(array)
+def trace_closed_loops_without_nodes(skeleton: np.ndarray, label_map: np.ndarray, min_points: int, min_length_px: float) -> list[np.ndarray]:
+    loops: list[np.ndarray] = []
+    unlabeled = skeleton & (label_map < 0)
+    visited_pixels: set[Pixel] = set()
+    for y, x in np.argwhere(unlabeled):
+        start = (int(y), int(x))
+        if start in visited_pixels:
+            continue
+        path = [start]
+        visited_pixels.add(start)
+        previous: Pixel | None = None
+        current = start
+        while True:
+            candidates = [pixel for pixel in pixel_neighbors(current, unlabeled) if pixel != previous]
+            candidates = [pixel for pixel in candidates if pixel not in visited_pixels or pixel == start]
+            if not candidates:
+                break
+            nxt = candidates[0]
+            if nxt == start:
+                path.append(nxt)
+                break
+            previous, current = current, nxt
+            path.append(current)
+            visited_pixels.add(current)
+        array = np.array([(px, py) for py, px in path], dtype=np.float32)
+        if keep_path(array, min_points, min_length_px):
+            loops.append(array)
+    return loops
 
-    return paths, int(np.count_nonzero(endpoints)), int(np.count_nonzero(branches))
+
+def orient_edge(edge: CentrelineEdge, from_node: int) -> np.ndarray:
+    if edge.u == from_node:
+        return edge.points_xy
+    return edge.points_xy[::-1].copy()
+
+
+def edge_other_node(edge: CentrelineEdge, node_id: int) -> int:
+    return edge.v if edge.u == node_id else edge.u
+
+
+def edge_direction_at_node(edge: CentrelineEdge, node_id: int, leaving: bool) -> np.ndarray | None:
+    oriented = orient_edge(edge, node_id)
+    if len(oriented) < 2:
+        return None
+    if leaving:
+        direction = oriented[min(4, len(oriented) - 1)] - oriented[0]
+    else:
+        direction = oriented[0] - oriented[min(4, len(oriented) - 1)]
+    norm = float(np.linalg.norm(direction))
+    return direction / norm if norm > 1e-9 else None
+
+
+def choose_smooth_continuation(
+    current_node: int,
+    incoming_edge: CentrelineEdge,
+    adjacency: dict[int, set[int]],
+    edge_by_id: dict[int, CentrelineEdge],
+    unused: set[int],
+    max_join_angle_deg: float,
+    max_corner_join_angle_deg: float,
+) -> int | None:
+    incoming_direction = edge_direction_at_node(incoming_edge, current_node, leaving=False)
+    if incoming_direction is None:
+        return None
+    available = list(adjacency.get(current_node, set()) & unused)
+    if len(adjacency.get(current_node, set())) == 2 and len(available) == 1:
+        outgoing_direction = edge_direction_at_node(edge_by_id[available[0]], current_node, leaving=True)
+        if outgoing_direction is not None and angle_between(incoming_direction, outgoing_direction) <= max_corner_join_angle_deg:
+            return available[0]
+    best: tuple[float, int] | None = None
+    for edge_id in available:
+        candidate = edge_by_id[edge_id]
+        outgoing_direction = edge_direction_at_node(candidate, current_node, leaving=True)
+        if outgoing_direction is None:
+            continue
+        angle = angle_between(incoming_direction, outgoing_direction)
+        if angle <= max_join_angle_deg:
+            score = (angle, edge_id)
+            if best is None or score < best:
+                best = score
+    return best[1] if best is not None else None
+
+
+def join_centreline_edges(
+    nodes: list[CentrelineNode],
+    edges: list[CentrelineEdge],
+    loops: list[np.ndarray],
+    min_points: int,
+    min_length_px: float,
+    max_join_angle_deg: float,
+    max_corner_join_angle_deg: float,
+) -> list[np.ndarray]:
+    adjacency: dict[int, set[int]] = {node.id: set() for node in nodes}
+    edge_by_id = {edge.id: edge for edge in edges}
+    for edge in edges:
+        adjacency.setdefault(edge.u, set()).add(edge.id)
+        adjacency.setdefault(edge.v, set()).add(edge.id)
+
+    unused = set(edge_by_id.keys())
+    strokes: list[np.ndarray] = []
+    while unused:
+        endpoint_nodes = [
+            node_id
+            for node_id, edge_ids in adjacency.items()
+            if len(edge_ids & unused) == 1
+        ]
+        if endpoint_nodes:
+            start_node = min(endpoint_nodes, key=lambda node_id: (nodes[node_id].y, nodes[node_id].x))
+        else:
+            start_node = min(
+                (node_id for node_id, edge_ids in adjacency.items() if edge_ids & unused),
+                key=lambda node_id: (nodes[node_id].y, nodes[node_id].x),
+            )
+
+        current_node = start_node
+        first_edge_id = min(adjacency[current_node] & unused, key=lambda edge_id: edge_by_id[edge_id].length_px)
+        current_edge = edge_by_id[first_edge_id]
+        unused.remove(first_edge_id)
+        stroke_parts = [orient_edge(current_edge, current_node)]
+        current_node = edge_other_node(current_edge, current_node)
+
+        while True:
+            next_edge_id = choose_smooth_continuation(
+                current_node,
+                current_edge,
+                adjacency,
+                edge_by_id,
+                unused,
+                max_join_angle_deg=max_join_angle_deg,
+                max_corner_join_angle_deg=max_corner_join_angle_deg,
+            )
+            if next_edge_id is None:
+                break
+            current_edge = edge_by_id[next_edge_id]
+            unused.remove(next_edge_id)
+            oriented = orient_edge(current_edge, current_node)
+            stroke_parts.append(oriented[1:] if len(oriented) > 1 else oriented)
+            current_node = edge_other_node(current_edge, current_node)
+
+        stroke = np.vstack(stroke_parts)
+        if keep_path(stroke, min_points, min_length_px):
+            strokes.append(stroke)
+
+    strokes.extend(loop for loop in loops if keep_path(loop, min_points, min_length_px))
+    return strokes
+
+
+def trace_centreline_paths(skeleton: np.ndarray, min_points: int, min_length_px: float, args: argparse.Namespace) -> tuple[list[np.ndarray], int, int, int, int, int]:
+    degree = neighbor_count(skeleton)
+    branch_pixel_count = int(np.count_nonzero(skeleton & (degree >= 3)))
+    nodes, label_map, endpoint_count, junction_zone_count = build_centreline_nodes(
+        skeleton,
+        degree,
+        junction_cluster_radius_px=args.junction_cluster_radius_px,
+    )
+    edges = build_centreline_edges(skeleton, label_map, nodes, min_length_px=min_length_px)
+    loops = []
+    if not nodes:
+        loops = trace_closed_loops_without_nodes(skeleton, label_map, min_points=min_points, min_length_px=min_length_px)
+    joined = join_centreline_edges(
+        nodes,
+        edges,
+        loops,
+        min_points=min_points,
+        min_length_px=min_length_px,
+        max_join_angle_deg=args.smooth_join_angle_deg,
+        max_corner_join_angle_deg=args.corner_join_angle_deg,
+    )
+    return joined, endpoint_count, branch_pixel_count, junction_zone_count, len(edges), len(joined)
 
 
 def path_length_px(path: np.ndarray) -> float:
@@ -479,17 +747,27 @@ def analyze_node_blobs(node_mask: np.ndarray, node_prob: np.ndarray, centreline:
 def claimed_pixels_from_strokes(strokes: list[np.ndarray], shape: tuple[int, int], radius: int = 1) -> np.ndarray:
     mask = np.zeros(shape, dtype=bool)
     height, width = shape
+    def mark_point(x_f: float, y_f: float) -> None:
+        x = int(round(float(x_f)))
+        y = int(round(float(y_f)))
+        if not (0 <= y < height and 0 <= x < width):
+            return
+        y0 = max(0, y - radius)
+        y1 = min(height, y + radius + 1)
+        x0 = max(0, x - radius)
+        x1 = min(width, x + radius + 1)
+        mask[y0:y1, x0:x1] = True
+
     for stroke in strokes:
-        for x_f, y_f in stroke:
-            x = int(round(float(x_f)))
-            y = int(round(float(y_f)))
-            if not (0 <= y < height and 0 <= x < width):
-                continue
-            y0 = max(0, y - radius)
-            y1 = min(height, y + radius + 1)
-            x0 = max(0, x - radius)
-            x1 = min(width, x + radius + 1)
-            mask[y0:y1, x0:x1] = True
+        if len(stroke) == 1:
+            mark_point(float(stroke[0, 0]), float(stroke[0, 1]))
+            continue
+        for start, end in zip(stroke[:-1], stroke[1:]):
+            length = float(np.linalg.norm(end - start))
+            steps = max(1, int(math.ceil(length * 2.0)))
+            for t in np.linspace(0.0, 1.0, steps + 1):
+                point = start * (1.0 - t) + end * t
+                mark_point(float(point[0]), float(point[1]))
     return mask
 
 
@@ -497,10 +775,13 @@ def reconstruct(probabilities: MLProbabilities, args: argparse.Namespace) -> Rec
     line_mask, node_mask, support_prob, support_mask = build_support_fields(probabilities, args)
     components = describe_support_components(support_mask, line_mask, node_mask, support_prob, args.min_component_pixels)
     centreline = centreline_from_components(components, support_mask.shape, args)
-    raw_strokes, endpoint_count, branch_count = trace_centreline_paths(
+    centreline_degree = neighbor_count(centreline)
+    junction_zone_mask = expanded_mask(centreline & (centreline_degree >= 3), args.junction_cluster_radius_px) & centreline
+    raw_strokes, endpoint_count, branch_count, junction_zone_count, centreline_edge_count, joined_stroke_count = trace_centreline_paths(
         centreline,
         min_points=args.min_stroke_points,
         min_length_px=args.min_stroke_length_px,
+        args=args,
     )
     simplified = [
         simplify_polyline(stroke, args.simplification_epsilon)
@@ -519,12 +800,16 @@ def reconstruct(probabilities: MLProbabilities, args: argparse.Namespace) -> Rec
         support_prob=support_prob,
         support_mask=support_mask,
         centreline_mask=centreline,
+        junction_zone_mask=junction_zone_mask,
         components=components,
         node_blobs=node_blobs,
         raw_strokes_px=raw_strokes,
         strokes_px=strokes,
         endpoint_count=endpoint_count,
         branch_count=branch_count,
+        junction_zone_count=junction_zone_count,
+        centreline_edge_count=centreline_edge_count,
+        joined_stroke_count=joined_stroke_count,
         claimed_support_pixel_count=claimed_count,
         support_coverage_fraction=claimed_count / max(support_count, 1),
         unclaimed_support_pixel_count=max(support_count - claimed_count, 0),
@@ -646,7 +931,11 @@ def compute_metrics(
             "discarded_component_count": discarded,
             "centreline_pixel_count": int(np.count_nonzero(result.centreline_mask)),
             "endpoint_count": result.endpoint_count,
+            "branch_pixel_count": result.branch_count,
             "branch_or_junction_count": result.branch_count,
+            "junction_zone_count": result.junction_zone_count,
+            "centreline_edge_count": result.centreline_edge_count,
+            "joined_stroke_count": result.joined_stroke_count,
             "node_blob_count": len(result.node_blobs),
             "node_blob_class_counts": node_classes,
             "claimed_support_pixel_count": result.claimed_support_pixel_count,
@@ -666,6 +955,9 @@ def compute_metrics(
             "min_component_pixels": args.min_component_pixels,
             "min_stroke_points": args.min_stroke_points,
             "min_stroke_length_px": args.min_stroke_length_px,
+            "junction_cluster_radius_px": args.junction_cluster_radius_px,
+            "smooth_join_angle_deg": args.smooth_join_angle_deg,
+            "corner_join_angle_deg": args.corner_join_angle_deg,
         },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
@@ -731,6 +1023,8 @@ def save_centreline_debug(probabilities: MLProbabilities, result: Reconstruction
     draw = ImageDraw.Draw(overlay)
     for y, x in np.argwhere(result.centreline_mask):
         draw.point((int(x), int(y)), fill=(230, 0, 0, 220))
+    for y, x in np.argwhere(result.junction_zone_mask):
+        draw.rectangle((int(x) - 1, int(y) - 1, int(x) + 1, int(y) + 1), fill=(255, 180, 0, 130))
     degree = neighbor_count(result.centreline_mask)
     for y, x in np.argwhere(result.centreline_mask & (degree == 1)):
         draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(40, 120, 255, 240))
@@ -846,9 +1140,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-suppression-weight", type=float, default=0.0)
     parser.add_argument("--min-component-pixels", type=int, default=8)
     parser.add_argument("--centreline-mode", choices=["thinning", "ridge"], default="thinning")
-    parser.add_argument("--simplification-epsilon", type=float, default=1.0)
+    parser.add_argument("--simplification-epsilon", type=float, default=0.5)
     parser.add_argument("--min-stroke-points", type=int, default=3)
     parser.add_argument("--min-stroke-length-px", type=float, default=4.0)
+    parser.add_argument("--junction-cluster-radius-px", type=int, default=5)
+    parser.add_argument("--smooth-join-angle-deg", type=float, default=38.0)
+    parser.add_argument("--corner-join-angle-deg", type=float, default=125.0)
     parser.add_argument("--coverage-radius-px", type=int, default=2)
     parser.add_argument("--coverage-warning-fraction", type=float, default=0.55)
     parser.add_argument("--fragment-warning-strokes", type=int, default=80)
