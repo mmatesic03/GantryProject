@@ -49,14 +49,18 @@ python src/quickdraw_rich_labels.py \
   --synthetic-rich \
   --synthetic-count 20 \
   --image-size 128 \
-  --seed 498
+  --seed 498 \
+  --line-width-min 2 \
+  --line-width-max 9
 ```
 
 The synthetic set includes simple line, square, triangle, circle/loop,
 T-junction, X-crossing, smooth bend, close parallel curves, and a simplified
 cat-tail/ground-contact case. Sparse polygon vertices are labelled as corners,
 closed strokes are not labelled as endpoints, and outputs are `.npy` arrays
-plus preview PNGs under `previews/`.
+plus preview PNGs under `previews/`. Use `--line-width-min` and
+`--line-width-max` for synthetic training sets so support thickness varies while
+the centreline target remains one-pixel stroke structure.
 
 For real QuickDraw data already placed under `data/quickdraw/raw/`:
 
@@ -78,6 +82,11 @@ The model is a lightweight shared U-Net encoder/decoder with separate heads:
 - corner probability
 - junction probability
 - tangent vector regression
+
+Training reports per-head validation metrics: support IoU, centreline IoU,
+endpoint/corner/junction heatmap IoU, precision/recall, and tangent
+consistency. This matters because support IoU can look excellent while
+centreline, corner, or tangent predictions still fail reconstruction.
 
 Run only a smoke pass to verify the pipeline:
 
@@ -152,6 +161,10 @@ The ML path writes:
 - `arduino_commands.txt`
 - `stroke_metrics.json`
 - `structure_probability_debug.png`
+- `structure_prediction_arrays.npz`
+- `structure_mask_debug.png`
+- individual `ml_*_probability.png` and `ml_*_mask.png` files for support,
+  centreline, endpoint, corner, junction, and tangent-valid predictions
 - `endpoint_corner_junction_tangent_overlay.png`
 - `reconstruction_debug.png`
 - `missed_support_pixels.png`
@@ -178,7 +191,9 @@ python src/quickdraw_rich_labels.py \
   --synthetic-rich \
   --synthetic-count 500 \
   --image-size 128 \
-  --seed 498
+  --seed 498 \
+  --line-width-min 2 \
+  --line-width-max 9
 
 python src/train_stroke_structure_model.py \
   --processed-dir data/quickdraw/rich_pilot \
@@ -188,7 +203,11 @@ python src/train_stroke_structure_model.py \
   --batch-size 8 \
   --base-channels 24 \
   --augment \
-  --progress-every 10
+  --progress-every 10 \
+  --support-loss-weight 0.5 \
+  --centreline-loss-weight 2.0 \
+  --corner-loss-weight 2.0 \
+  --tangent-loss-weight 2.0
 ```
 
 Keep the existing contour baseline, heuristic skeleton pipeline, and 3-class ML

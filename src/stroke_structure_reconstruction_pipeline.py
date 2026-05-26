@@ -98,6 +98,63 @@ def prob_panel(array: np.ndarray) -> Image.Image:
     return Image.fromarray((np.clip(array, 0.0, 1.0) * 255.0).astype(np.uint8), mode="L").convert("RGB")
 
 
+def mask_panel(mask: np.ndarray) -> Image.Image:
+    return Image.fromarray(np.where(mask, 255, 0).astype(np.uint8), mode="L").convert("RGB")
+
+
+def save_prediction_mask_outputs(
+    probabilities: dict[str, np.ndarray],
+    labels: StructureLabels,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Save the raw ML heads and thresholded masks used by reconstruction."""
+    masks = {
+        "support": labels.support,
+        "centreline": labels.centreline,
+        "endpoint": labels.endpoint >= args.endpoint_threshold,
+        "corner": labels.corner >= args.corner_threshold,
+        "junction": labels.junction >= args.junction_threshold,
+        "tangent_valid": labels.tangent_valid,
+    }
+    np.savez_compressed(
+        output_dir / "structure_prediction_arrays.npz",
+        support_probability=probabilities["support"].astype(np.float32),
+        centreline_probability=probabilities["centreline"].astype(np.float32),
+        endpoint_probability=probabilities["endpoint"].astype(np.float32),
+        corner_probability=probabilities["corner"].astype(np.float32),
+        junction_probability=probabilities["junction"].astype(np.float32),
+        tangent_cos=probabilities["tangent_cos"].astype(np.float32),
+        tangent_sin=probabilities["tangent_sin"].astype(np.float32),
+        support_mask=masks["support"].astype(np.uint8),
+        centreline_mask=masks["centreline"].astype(np.uint8),
+        endpoint_mask=masks["endpoint"].astype(np.uint8),
+        corner_mask=masks["corner"].astype(np.uint8),
+        junction_mask=masks["junction"].astype(np.uint8),
+        tangent_valid_mask=masks["tangent_valid"].astype(np.uint8),
+    )
+
+    for name in ["support", "centreline", "endpoint", "corner", "junction"]:
+        prob_panel(probabilities[name]).save(output_dir / f"ml_{name}_probability.png")
+        mask_panel(masks[name]).save(output_dir / f"ml_{name}_mask.png")
+    mask_panel(masks["tangent_valid"]).save(output_dir / "ml_tangent_valid_mask.png")
+
+    height, width = labels.gray.shape
+    panels = [
+        Image.fromarray(labels.gray, mode="L").convert("RGB"),
+        mask_panel(masks["support"]),
+        mask_panel(masks["centreline"]),
+        mask_panel(masks["endpoint"]),
+        mask_panel(masks["corner"]),
+        mask_panel(masks["junction"]),
+        mask_panel(masks["tangent_valid"]),
+    ]
+    canvas = Image.new("RGB", (width * len(panels), height), "white")
+    for i, panel in enumerate(panels):
+        canvas.paste(panel, (i * width, 0))
+    canvas.save(output_dir / "structure_mask_debug.png")
+
+
 def save_probability_debug(gray: np.ndarray, probabilities: dict[str, np.ndarray], labels: StructureLabels, output_path: Path) -> None:
     panels = [
         Image.fromarray(gray, mode="L").convert("RGB"),
@@ -169,6 +226,7 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     }
     save_arduino_commands(commands, output_dir / "arduino_commands.txt")
     save_json(metrics, output_dir / "stroke_metrics.json")
+    save_prediction_mask_outputs(probabilities, labels, output_dir, args)
     save_probability_debug(labels.gray, probabilities, labels, output_dir / "structure_probability_debug.png")
     save_structure_overlay(labels, output_dir / "endpoint_corner_junction_tangent_overlay.png")
     save_reconstruction_debug(labels, result, output_dir / "reconstruction_debug.png")

@@ -476,6 +476,9 @@ def write_rich_dataset(
     corner_angle_threshold_deg: float,
     corner_stride: int,
     preview_count: int,
+    line_width_min: int | None = None,
+    line_width_max: int | None = None,
+    seed: int = 498,
 ) -> dict:
     image_dir = processed_dir / "images"
     label_dir = processed_dir / "labels"
@@ -486,11 +489,18 @@ def write_rich_dataset(
 
     records = []
     totals = {"endpoint_count": 0, "corner_count": 0, "junction_count": 0, "stroke_count": 0}
+    rng = np.random.default_rng(seed)
+    use_random_line_width = (
+        line_width_min is not None
+        and line_width_max is not None
+        and line_width_max >= line_width_min
+    )
     for index, sample in enumerate(samples):
+        record_line_width = int(rng.integers(line_width_min, line_width_max + 1)) if use_random_line_width else int(line_width)
         image, labels, meta = render_rich_labels(
             sample,
             image_size=image_size,
-            line_width=line_width,
+            line_width=record_line_width,
             heatmap_sigma=heatmap_sigma,
             corner_angle_threshold_deg=corner_angle_threshold_deg,
             corner_stride=corner_stride,
@@ -513,7 +523,7 @@ def write_rich_dataset(
                 "labels": label_paths,
                 "category": sample.category,
                 "key_id": sample.key_id,
-                "metadata": meta,
+                "metadata": {**meta, "line_width": record_line_width},
             }
         )
 
@@ -521,6 +531,9 @@ def write_rich_dataset(
         **LABEL_SCHEMA,
         "image_size": image_size,
         "line_width": line_width,
+        "line_width_min": line_width_min,
+        "line_width_max": line_width_max,
+        "uses_random_line_width": use_random_line_width,
         "heatmap_sigma": heatmap_sigma,
         "corner_angle_threshold_deg": corner_angle_threshold_deg,
         "corner_stride": corner_stride,
@@ -541,6 +554,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-drawings-per-category", type=int, default=100)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--line-width", type=int, default=3)
+    parser.add_argument("--line-width-min", type=int, default=None)
+    parser.add_argument("--line-width-max", type=int, default=None)
     parser.add_argument("--heatmap-sigma", type=float, default=2.0)
     parser.add_argument("--corner-angle-threshold", type=float, default=135.0)
     parser.add_argument("--corner-stride", type=int, default=2)
@@ -569,6 +584,9 @@ def main() -> None:
         corner_angle_threshold_deg=args.corner_angle_threshold,
         corner_stride=args.corner_stride,
         preview_count=args.preview_count,
+        line_width_min=args.line_width_min,
+        line_width_max=args.line_width_max,
+        seed=args.seed,
     )
     print(f"Wrote {manifest['record_count']} rich label records to {processed_dir}")
     print(f"Label schema: {manifest['schema']}")

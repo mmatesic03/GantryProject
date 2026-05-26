@@ -119,6 +119,9 @@ def ensure_rich_data(args: argparse.Namespace) -> None:
         corner_angle_threshold_deg=args.corner_angle_threshold,
         corner_stride=args.corner_stride,
         preview_count=args.preview_count,
+        line_width_min=args.line_width_min,
+        line_width_max=args.line_width_max,
+        seed=args.seed,
     )
     print(f"Generated {manifest['record_count']} rich label records in {processed_dir}")
 
@@ -191,8 +194,10 @@ def move_targets(targets: dict, device):
 def evaluate(model, loader, device, args: argparse.Namespace) -> dict:
     model.eval()
     total_loss = 0.0
-    support_intersection = 0.0
-    support_union = 0.0
+    stats = {
+        head: {"intersection": 0.0, "union": 0.0, "predicted": 0.0, "target": 0.0}
+        for head in MASK_HEADS
+    }
     tangent_scores: list[float] = []
     with torch.no_grad():
         for images, targets in loader:
@@ -202,21 +207,32 @@ def evaluate(model, loader, device, args: argparse.Namespace) -> dict:
             loss, _ = structure_loss(outputs, targets, args)
             total_loss += float(loss.item()) * images.shape[0]
             probs = sigmoid_structure_outputs(outputs)
-            pred_support = probs["support"] >= args.eval_threshold
-            target_support = targets["support"] >= 0.5
-            support_intersection += float(torch.count_nonzero(pred_support & target_support).item())
-            support_union += float(torch.count_nonzero(pred_support | target_support).item())
+            for head in MASK_HEADS:
+                pred_threshold = args.eval_threshold if head in {"support", "centreline"} else args.heatmap_eval_threshold
+                target_threshold = 0.5 if head in {"support", "centreline"} else args.heatmap_eval_threshold
+                pred_mask = probs[head] >= pred_threshold
+                target_mask = targets[head] >= target_threshold
+                stats[head]["intersection"] += float(torch.count_nonzero(pred_mask & target_mask).item())
+                stats[head]["union"] += float(torch.count_nonzero(pred_mask | target_mask).item())
+                stats[head]["predicted"] += float(torch.count_nonzero(pred_mask).item())
+                stats[head]["target"] += float(torch.count_nonzero(target_mask).item())
             valid = targets["tangent_valid"] > 0.5
             if torch.count_nonzero(valid) > 0:
                 pred = functional.normalize(outputs["tangent"], dim=1)
                 target = functional.normalize(targets["tangent"], dim=1)
                 score = torch.sum(torch.sum(pred * target, dim=1, keepdim=True) * valid) / torch.clamp(torch.sum(valid), min=1.0)
                 tangent_scores.append(float(score.item()))
-    return {
+    metrics = {
         "loss": total_loss / max(len(loader.dataset), 1),
-        "support_iou": support_intersection / max(support_union, 1.0),
         "tangent_consistency": float(np.mean(tangent_scores)) if tangent_scores else 0.0,
+        "eval_threshold": args.eval_threshold,
+        "heatmap_eval_threshold": args.heatmap_eval_threshold,
     }
+    for head, values in stats.items():
+        metrics[f"{head}_iou"] = values["intersection"] / max(values["union"], 1.0)
+        metrics[f"{head}_precision"] = values["intersection"] / max(values["predicted"], 1.0)
+        metrics[f"{head}_recall"] = values["intersection"] / max(values["target"], 1.0)
+    return metrics
 
 
 def to_u8_probability(array: np.ndarray) -> np.ndarray:
@@ -349,7 +365,11 @@ def train(args: argparse.Namespace) -> dict:
         if "validation" in entry:
             print(
                 f"epoch {epoch + 1}/{args.epochs} train_loss={entry['train_loss']:.4f} "
-                f"val_loss={entry['validation']['loss']:.4f} support_iou={entry['validation']['support_iou']:.4f}"
+                f"val_loss={entry['validation']['loss']:.4f} "
+                f"support_iou={entry['validation']['support_iou']:.4f} "
+                f"centreline_iou={entry['validation']['centreline_iou']:.4f} "
+                f"corner_iou={entry['validation']['corner_iou']:.4f} "
+                f"tangent={entry['validation']['tangent_consistency']:.4f}"
             )
         else:
             print(f"epoch {epoch + 1}/{args.epochs} train_loss={entry['train_loss']:.4f}")
@@ -406,6 +426,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-drawings-per-category", type=int, default=100)
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--line-width", type=int, default=3)
+    parser.add_argument("--line-width-min", type=int, default=None)
+    parser.add_argument("--line-width-max", type=int, default=None)
     parser.add_argument("--heatmap-sigma", type=float, default=2.0)
     parser.add_argument("--corner-angle-threshold", type=float, default=135.0)
     parser.add_argument("--corner-stride", type=int, default=2)
@@ -416,14 +438,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--dice-loss-weight", type=float, default=0.5)
-    parser.add_argument("--support-loss-weight", type=float, default=1.0)
-    parser.add_argument("--centreline-loss-weight", type=float, default=1.0)
+    parser.add_argument("--support-loss-weight", type=float, default=0.5)
+    parser.add_argument("--centreline-loss-weight", type=float, default=2.0)
     parser.add_argument("--endpoint-loss-weight", type=float, default=1.5)
-    parser.add_argument("--corner-loss-weight", type=float, default=1.2)
+    parser.add_argument("--corner-loss-weight", type=float, default=2.0)
     parser.add_argument("--junction-loss-weight", type=float, default=1.5)
-    parser.add_argument("--tangent-loss-weight", type=float, default=1.0)
-    parser.add_argument("--tangent-cosine-loss-weight", type=float, default=0.5)
+    parser.add_argument("--tangent-loss-weight", type=float, default=2.0)
+    parser.add_argument("--tangent-cosine-loss-weight", type=float, default=1.0)
     parser.add_argument("--eval-threshold", type=float, default=0.5)
+    parser.add_argument("--heatmap-eval-threshold", type=float, default=0.35)
     return parser
 
 
