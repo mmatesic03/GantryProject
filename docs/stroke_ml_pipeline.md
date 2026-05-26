@@ -250,6 +250,33 @@ metrics for detected ports, allowed/disallowed local routes, edges using node
 support, and edges rejected by node routing. It is disabled by default so runs
 can still be compared against the earlier ML graph behaviour.
 
+## Clean-Slate ML Support Reconstruction
+
+`src/stroke_ml_reconstruction_pipeline.py` is a separate experimental path that
+starts from ML probability support instead of node-centroid graph candidates. It
+builds line/node/support masks, reconstructs centreline geometry component by
+component, analyses node blobs as local topology patches, and then exports the
+same Arduino serial command format as the other pipelines.
+
+Example:
+
+```bash
+python src/stroke_ml_reconstruction_pipeline.py \
+  --image input_images/cats.jpg \
+  --model-path models/stroke_unet_quickdraw_v1_best.pt \
+  --output-dir output/ml_reconstruction_cats \
+  --line-threshold 0.35 \
+  --node-threshold 0.35 \
+  --support-threshold 0.30 \
+  --node-support-weight 0.65 \
+  --centreline-mode thinning
+```
+
+This pipeline writes `support_mask_debug.png`, `component_debug.png`,
+`centreline_debug.png`, `node_blob_debug.png`, `topology_debug.png`,
+`stroke_sequence_debug.png`, `gantry_path_preview.png`, `arduino_commands.txt`,
+and `stroke_metrics.json`.
+
 ## Tune ML Graph Parameters
 
 Manual tuning is slow because the best reconstruction settings depend on the
