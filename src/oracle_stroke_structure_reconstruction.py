@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -147,6 +147,13 @@ def heatmap_count(heatmap: np.ndarray, threshold: float) -> int:
     return len(connected_components(heatmap >= threshold))
 
 
+def component_mask(points: list[Pixel], shape: tuple[int, int]) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    for y, x in points:
+        mask[y, x] = True
+    return mask
+
+
 def classify_node_component(points: list[Pixel], labels: StructureLabels, args: argparse.Namespace) -> str:
     ys = np.array([p[0] for p in points], dtype=np.int32)
     xs = np.array([p[1] for p in points], dtype=np.int32)
@@ -266,7 +273,7 @@ def build_edges(labels: StructureLabels, nodes: list[StructureNode], label_map: 
     for points in connected_components(unvisited):
         if len(points) < args.min_points:
             continue
-        ordered = order_component_path(points, labels)
+        ordered = order_component_path(points, labels, args)
         if len(ordered) >= args.min_points:
             loop_node = len(nodes)
             nodes.append(StructureNode(loop_node, "loop", points[:1], float(ordered[0, 0]), float(ordered[0, 1])))
@@ -274,10 +281,148 @@ def build_edges(labels: StructureLabels, nodes: list[StructureNode], label_map: 
     return edges
 
 
-def order_component_path(points: list[Pixel], labels: StructureLabels) -> np.ndarray:
-    mask = np.zeros_like(labels.centreline, dtype=bool)
-    for y, x in points:
-        mask[y, x] = True
+def shortest_path_pixels(mask: np.ndarray, start: Pixel, goal: Pixel) -> list[Pixel]:
+    queue = [start]
+    parents: dict[Pixel, Pixel | None] = {start: None}
+    head = 0
+    while head < len(queue):
+        current = queue[head]
+        head += 1
+        if current == goal:
+            break
+        for nbr in pixel_neighbors(current, mask):
+            if nbr not in parents:
+                parents[nbr] = current
+                queue.append(nbr)
+    if goal not in parents:
+        return []
+    path = []
+    current: Pixel | None = goal
+    while current is not None:
+        path.append(current)
+        current = parents[current]
+    path.reverse()
+    return path
+
+
+def longest_endpoint_path(mask: np.ndarray, endpoints: list[Pixel]) -> list[Pixel]:
+    best: list[Pixel] = []
+    if len(endpoints) == 2:
+        return shortest_path_pixels(mask, endpoints[0], endpoints[1])
+    # Endpoint counts above two usually mean small raster spurs. Testing every
+    # pair is still cheap for our generated labels and picks the main stroke.
+    for i, start in enumerate(endpoints):
+        for goal in endpoints[i + 1 :]:
+            path = shortest_path_pixels(mask, start, goal)
+            if len(path) > len(best):
+                best = path
+    return best
+
+
+def edge_key(a: Pixel, b: Pixel) -> tuple[Pixel, Pixel]:
+    return tuple(sorted([a, b]))
+
+
+def nearest_mask_pixel(mask: np.ndarray, yx: tuple[float, float]) -> Pixel:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return (0, 0)
+    target_y, target_x = yx
+    distances = (ys.astype(np.float32) - target_y) ** 2 + (xs.astype(np.float32) - target_x) ** 2
+    idx = int(np.argmin(distances))
+    return int(ys[idx]), int(xs[idx])
+
+
+def component_endpoint_components(labels: StructureLabels, mask: np.ndarray, args: argparse.Namespace) -> list[list[Pixel]]:
+    nearby = expanded_mask(mask, args.node_radius_px)
+    return connected_components((labels.endpoint >= args.endpoint_threshold) & nearby)
+
+
+def edge_cover_walk(mask: np.ndarray, start: Pixel, labels: StructureLabels) -> list[Pixel]:
+    adjacency = {pixel: pixel_neighbors(pixel, mask) for pixel in map(tuple, np.argwhere(mask))}
+    visited_edges: set[tuple[Pixel, Pixel]] = set()
+    path = [start]
+    stack: list[tuple[Pixel, Pixel | None]] = [(start, None)]
+    while stack:
+        current, previous = stack[-1]
+        candidates = [pixel for pixel in adjacency.get(current, []) if edge_key(current, pixel) not in visited_edges]
+        if candidates:
+            candidates.sort(key=lambda pixel: tangent_alignment(labels, current, previous, pixel), reverse=True)
+            nxt = candidates[0]
+            visited_edges.add(edge_key(current, nxt))
+            path.append(nxt)
+            stack.append((nxt, current))
+            continue
+        stack.pop()
+        if stack:
+            parent, _ = stack[-1]
+            if any(edge_key(parent, pixel) not in visited_edges for pixel in adjacency.get(parent, [])):
+                path.append(parent)
+    return path
+
+
+def trim_closed_walk_at_endpoint(
+    ordered: list[Pixel],
+    endpoint_component: list[Pixel],
+    shape: tuple[int, int],
+    component_size: int,
+    args: argparse.Namespace,
+) -> list[Pixel]:
+    endpoint_mask = component_mask(endpoint_component, shape)
+    endpoint_zone = expanded_mask(endpoint_mask, args.node_radius_px)
+    visited: set[Pixel] = set()
+    for i, pixel in enumerate(ordered):
+        visited.add(pixel)
+        y, x = pixel
+        if i < args.min_points:
+            continue
+        if len(visited) / max(component_size, 1) < 0.55:
+            continue
+        if 0 <= y < shape[0] and 0 <= x < shape[1] and endpoint_zone[y, x]:
+            return ordered[: i + 1]
+    return ordered
+
+
+def decode_simple_components(labels: StructureLabels, args: argparse.Namespace) -> tuple[list[np.ndarray], np.ndarray]:
+    """Decode low-branch components as continuous strokes.
+
+    This handles open paths, closed loops with no endpoint, and closed strokes
+    that have a single start/end endpoint blob. Components with more than two
+    endpoint blobs are left for the explicit graph decoder because those are the
+    branch cases where a junction decision is genuinely needed.
+    """
+    consumed = np.zeros_like(labels.centreline, dtype=bool)
+    strokes: list[np.ndarray] = []
+    for points in connected_components(labels.centreline.astype(bool)):
+        if len(points) < args.min_points:
+            continue
+        mask = component_mask(points, labels.centreline.shape)
+        endpoint_components = component_endpoint_components(labels, mask, args)
+        if len(endpoint_components) > 2:
+            continue
+        if endpoint_components:
+            component = endpoint_components[0]
+            start = nearest_mask_pixel(
+                mask,
+                (
+                    float(np.mean([p[0] for p in component])),
+                    float(np.mean([p[1] for p in component])),
+                ),
+            )
+        else:
+            degree = neighbor_count(mask)
+            degree_endpoints = list(map(tuple, np.argwhere(mask & (degree <= 1))))
+            start = degree_endpoints[0] if degree_endpoints else min(points)
+        ordered = edge_cover_walk(mask, start, labels)
+        if len(endpoint_components) == 1:
+            ordered = trim_closed_walk_at_endpoint(ordered, endpoint_components[0], labels.centreline.shape, len(points), args)
+        if len(ordered) >= args.min_points:
+            strokes.append(np.array([(x, y) for y, x in ordered], dtype=np.float32))
+            consumed |= mask
+    return strokes, consumed
+
+
+def tangent_greedy_path(mask: np.ndarray, points: list[Pixel], labels: StructureLabels) -> list[Pixel]:
     endpoints = [p for p in points if len(pixel_neighbors(p, mask)) <= 1]
     start = endpoints[0] if endpoints else points[0]
     ordered = [start]
@@ -293,6 +438,15 @@ def order_component_path(points: list[Pixel], labels: StructureLabels) -> np.nda
         ordered.append(nxt)
         visited.add(nxt)
         previous, current = current, nxt
+    return ordered
+
+
+def order_component_path(points: list[Pixel], labels: StructureLabels, args: argparse.Namespace) -> np.ndarray:
+    mask = component_mask(points, labels.centreline.shape)
+    endpoints = [p for p in points if len(pixel_neighbors(p, mask)) <= 1]
+    ordered = longest_endpoint_path(mask, endpoints) if len(endpoints) >= 2 else []
+    if not ordered:
+        ordered = tangent_greedy_path(mask, points, labels)
     return np.array([(x, y) for y, x in ordered], dtype=np.float32)
 
 
@@ -403,6 +557,73 @@ def claimed_pixels_from_strokes(strokes: list[np.ndarray], shape: tuple[int, int
     return mask
 
 
+def segment_pixels(start_xy: np.ndarray, end_xy: np.ndarray, shape: tuple[int, int]) -> list[Pixel]:
+    distance = float(np.linalg.norm(end_xy - start_xy))
+    steps = max(2, int(math.ceil(distance)) + 1)
+    pixels: list[Pixel] = []
+    seen: set[Pixel] = set()
+    for t in np.linspace(0.0, 1.0, steps):
+        x, y = start_xy * (1.0 - t) + end_xy * t
+        pixel = (int(round(y)), int(round(x)))
+        if 0 <= pixel[0] < shape[0] and 0 <= pixel[1] < shape[1] and pixel not in seen:
+            seen.add(pixel)
+            pixels.append(pixel)
+    return pixels
+
+
+def bridge_support_fraction(labels: StructureLabels, start_xy: np.ndarray, end_xy: np.ndarray) -> float:
+    pixels = segment_pixels(start_xy, end_xy, labels.support.shape)
+    if not pixels:
+        return 0.0
+    supported = sum(1 for y, x in pixels if labels.support[y, x] or labels.tangent_valid[y, x])
+    return supported / len(pixels)
+
+
+def merge_oriented_strokes(first: np.ndarray, first_end: int, second: np.ndarray, second_end: int) -> np.ndarray:
+    left = first[::-1].copy() if first_end == 0 else first
+    right = second if second_end == 0 else second[::-1].copy()
+    return np.vstack([left, right[1:] if np.linalg.norm(left[-1] - right[0]) < 1e-6 else right])
+
+
+def stitch_close_strokes(strokes: list[np.ndarray], labels: StructureLabels, args: argparse.Namespace) -> list[np.ndarray]:
+    if getattr(args, "disable_stitching", False):
+        return strokes
+    max_gap = float(getattr(args, "stitch_gap_px", 0.0))
+    if max_gap <= 0 or len(strokes) < 2:
+        return strokes
+    min_support = float(getattr(args, "stitch_support_fraction", 0.5))
+    merged = [stroke.copy() for stroke in strokes]
+    while True:
+        best: tuple[float, int, int, int, int] | None = None
+        for i, first in enumerate(merged):
+            if len(first) == 0:
+                continue
+            first_ends = [first[0], first[-1]]
+            for j in range(i + 1, len(merged)):
+                second = merged[j]
+                if len(second) == 0:
+                    continue
+                second_ends = [second[0], second[-1]]
+                for first_end, first_xy in enumerate(first_ends):
+                    for second_end, second_xy in enumerate(second_ends):
+                        distance = float(np.linalg.norm(first_xy - second_xy))
+                        if distance > max_gap:
+                            continue
+                        support_fraction = bridge_support_fraction(labels, first_xy, second_xy)
+                        if support_fraction < min_support:
+                            continue
+                        score = distance - 0.25 * support_fraction
+                        candidate = (score, i, first_end, j, second_end)
+                        if best is None or candidate < best:
+                            best = candidate
+        if best is None:
+            break
+        _, i, first_end, j, second_end = best
+        merged[i] = merge_oriented_strokes(merged[i], first_end, merged[j], second_end)
+        del merged[j]
+    return merged
+
+
 def tangent_consistency(strokes: list[np.ndarray], labels: StructureLabels) -> float:
     scores = []
     height, width = labels.centreline.shape
@@ -471,10 +692,15 @@ def decode_structure(labels: StructureLabels, args: argparse.Namespace) -> Decod
     metadata_result = decode_from_continuity_metadata(labels, args)
     if metadata_result is not None:
         return metadata_result
-    nodes, label_map = build_nodes(labels, args)
-    edges = build_edges(labels, nodes, label_map, args)
-    raw_strokes = stitch_edges(edges, nodes, labels, args)
-    simplified = [simplify_polyline(stroke, args.simplification_epsilon).astype(np.float32) for stroke in raw_strokes]
+    simple_strokes, consumed_centreline = decode_simple_components(labels, args)
+    graph_labels = labels
+    if np.any(consumed_centreline):
+        graph_labels = replace(labels, centreline=labels.centreline.astype(bool) & ~consumed_centreline)
+    nodes, label_map = build_nodes(graph_labels, args)
+    edges = build_edges(graph_labels, nodes, label_map, args)
+    raw_strokes = simple_strokes + stitch_edges(edges, nodes, graph_labels, args)
+    stitched_raw = stitch_close_strokes(raw_strokes, labels, args)
+    simplified = [simplify_polyline(stroke, args.simplification_epsilon).astype(np.float32) for stroke in stitched_raw]
     strokes = [stroke for stroke in simplified if len(stroke) >= args.min_points]
     claimed = claimed_pixels_from_strokes(strokes, labels.support.shape, radius=args.coverage_radius_px) & labels.support
     missed = labels.support & ~claimed
@@ -489,7 +715,7 @@ def decode_structure(labels: StructureLabels, args: argparse.Namespace) -> Decod
                 break
     return DecodeResult(
         strokes_px=strokes,
-        raw_strokes_px=raw_strokes,
+        raw_strokes_px=stitched_raw,
         edges=edges,
         nodes=nodes,
         claimed_support_mask=claimed,
@@ -594,6 +820,11 @@ def compute_structure_metrics(
         "model_path_used": labels.model_path,
         "label_schema_used": labels.label_schema,
         "stroke_point_counts": [int(count) for count in counts],
+        "decoder": {
+            "stitch_gap_px": float(getattr(args, "stitch_gap_px", 0.0)),
+            "stitch_support_fraction": float(getattr(args, "stitch_support_fraction", 0.5)),
+            "disable_stitching": bool(getattr(args, "disable_stitching", False)),
+        },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
     }
@@ -717,6 +948,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--endpoint-usage-radius-px", type=float, default=5.0)
     parser.add_argument("--min-points", type=int, default=2)
     parser.add_argument("--simplification-epsilon", type=float, default=1.25)
+    parser.add_argument("--stitch-gap-px", type=float, default=6.0)
+    parser.add_argument("--stitch-support-fraction", type=float, default=0.5)
+    parser.add_argument("--disable-stitching", action="store_true")
     parser.add_argument("--oracle-continuity-metadata", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
