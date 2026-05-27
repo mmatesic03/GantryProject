@@ -137,6 +137,46 @@ def xy_to_yx(point: np.ndarray) -> Pixel:
     return int(round(float(y))), int(round(float(x)))
 
 
+def topology_neighbors(pixel: Pixel, mask: np.ndarray) -> list[Pixel]:
+    """Return skeleton graph neighbors without redundant 2x2 diagonal links."""
+    y, x = pixel
+    height, width = mask.shape
+    result: list[Pixel] = []
+    for dy, dx in [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1)]:
+        ny, nx = y + dy, x + dx
+        if not (0 <= ny < height and 0 <= nx < width and mask[ny, nx]):
+            continue
+        if dy != 0 and dx != 0 and (mask[y, nx] or mask[ny, x]):
+            continue
+        result.append((ny, nx))
+    return result
+
+
+def topology_neighbor_count(mask: np.ndarray) -> np.ndarray:
+    count = np.zeros(mask.shape, dtype=np.uint8)
+    for y, x in map(tuple, np.argwhere(mask)):
+        count[y, x] = len(topology_neighbors((int(y), int(x)), mask))
+    return count
+
+
+def topology_connected_components(mask: np.ndarray) -> list[list[Pixel]]:
+    remaining = set(map(tuple, np.argwhere(mask)))
+    components: list[list[Pixel]] = []
+    while remaining:
+        start = remaining.pop()
+        stack = [start]
+        points = [start]
+        while stack:
+            pixel = stack.pop()
+            for nbr in topology_neighbors(pixel, mask):
+                if nbr in remaining:
+                    remaining.remove(nbr)
+                    stack.append(nbr)
+                    points.append(nbr)
+        components.append(points)
+    return components
+
+
 def line_pixels(start: Pixel, end: Pixel, shape: tuple[int, int]) -> list[Pixel]:
     y0, x0 = start
     y1, x1 = end
@@ -265,7 +305,7 @@ def merge_nearby_evidence(points: list[EvidencePoint], merge_radius: float) -> l
 
 
 def local_min_degree(mask: np.ndarray, pixel: Pixel, radius: int) -> int:
-    degree = neighbor_count(mask)
+    degree = topology_neighbor_count(mask)
     y, x = pixel
     y0, y1 = max(0, y - radius), min(mask.shape[0], y + radius + 1)
     x0, x1 = max(0, x - radius), min(mask.shape[1], x + radius + 1)
@@ -337,14 +377,14 @@ def prune_short_spurs(mask: np.ndarray, protected: np.ndarray, max_length: int) 
     changed = True
     while changed:
         changed = False
-        degree = neighbor_count(pruned)
+        degree = topology_neighbor_count(pruned)
         endpoints = list(map(tuple, np.argwhere(pruned & (degree <= 1) & ~protected)))
         for start in endpoints:
             path = [start]
             previous: Pixel | None = None
             current = start
             while len(path) <= max_length + 1:
-                candidates = [p for p in pixel_neighbors(current, pruned) if p != previous]
+                candidates = [p for p in topology_neighbors(current, pruned) if p != previous]
                 if len(candidates) != 1:
                     break
                 previous, current = current, candidates[0]
@@ -368,8 +408,8 @@ def bridge_small_gaps(
     bridged = mask.astype(bool).copy()
     bridge_count = 0
     for _ in range(max(1, args.bridge_iterations)):
-        degree = neighbor_count(bridged)
-        components = connected_components(bridged)
+        degree = topology_neighbor_count(bridged)
+        components = topology_connected_components(bridged)
         component_id = np.full(bridged.shape, -1, dtype=np.int32)
         terminals: list[tuple[Pixel, int]] = []
         for idx, component in enumerate(components):
@@ -423,7 +463,7 @@ def shortest_path(mask: np.ndarray, start: Pixel, goal: Pixel) -> list[Pixel]:
         head += 1
         if current == goal:
             break
-        for nbr in pixel_neighbors(current, mask):
+        for nbr in topology_neighbors(current, mask):
             if nbr not in parents:
                 parents[nbr] = current
                 queue.append(nbr)
@@ -458,7 +498,7 @@ def trace_unvisited_path(mask: np.ndarray, start: Pixel, labels: StructureLabels
     previous: Pixel | None = None
     current = start
     while True:
-        candidates = [p for p in pixel_neighbors(current, mask) if p != previous and p not in visited]
+        candidates = [p for p in topology_neighbors(current, mask) if p != previous and p not in visited]
         if not candidates:
             break
         candidates.sort(key=lambda p: tangent_step_score(labels, previous, current, p), reverse=True)
@@ -497,7 +537,7 @@ def edge_cover_walk(mask: np.ndarray, start: Pixel, labels: StructureLabels) -> 
     pixels, but it prevents a useful centreline component from being reduced to
     many tiny graph fragments.
     """
-    adjacency = {pixel: pixel_neighbors(pixel, mask) for pixel in map(tuple, np.argwhere(mask))}
+    adjacency = {pixel: topology_neighbors(pixel, mask) for pixel in map(tuple, np.argwhere(mask))}
     visited_edges: set[tuple[Pixel, Pixel]] = set()
     path = [start]
     stack: list[tuple[Pixel, Pixel | None]] = [(start, None)]
@@ -577,7 +617,7 @@ def component_terminals(component_mask_: np.ndarray, terminals: list[EvidencePoi
 
 
 def component_degree_endpoints(mask: np.ndarray) -> list[Pixel]:
-    degree = neighbor_count(mask)
+    degree = topology_neighbor_count(mask)
     return list(map(tuple, np.argwhere(mask & (degree <= 1))))
 
 
@@ -595,17 +635,37 @@ def trace_simple_component(
     return np.array([(x, y) for y, x in path], dtype=np.float32)
 
 
-def build_node_map(mask: np.ndarray, terminals: list[Pixel], args: argparse.Namespace) -> tuple[list[InternalNode], np.ndarray]:
-    degree = neighbor_count(mask)
-    node_zone = mask & ((degree != 2) | expanded_mask(component_mask(terminals, mask.shape), args.node_radius_px))
+def build_node_map(
+    mask: np.ndarray,
+    terminals: list[Pixel],
+    labels: StructureLabels,
+    args: argparse.Namespace,
+) -> tuple[list[InternalNode], np.ndarray]:
+    degree = topology_neighbor_count(mask)
+    endpoint_zone = expanded_mask(labels.endpoint >= args.endpoint_threshold, args.node_radius_px) & mask
+    junction_zone = expanded_mask(labels.junction >= args.junction_threshold, args.node_radius_px) & mask
+    corner_zone = expanded_mask(labels.corner >= args.corner_threshold, args.node_radius_px) & mask
+    terminal_zone = expanded_mask(component_mask(terminals, mask.shape), args.node_radius_px) & mask
+    degree_terminal_zone = expanded_mask(mask & (degree <= 1), args.node_radius_px) & mask
+    degree_branch_zone = expanded_mask(mask & (degree >= 3), args.raster_branch_node_radius_px) & mask & ~corner_zone
+    node_zone = mask & (endpoint_zone | junction_zone | terminal_zone | degree_terminal_zone | degree_branch_zone)
     label_map = np.full(mask.shape, -1, dtype=np.int32)
     nodes: list[InternalNode] = []
     for node_id, component in enumerate(connected_components(node_zone)):
         ys = np.array([p[0] for p in component], dtype=np.float32)
         xs = np.array([p[1] for p in component], dtype=np.float32)
-        max_degree = int(np.max(degree[ys.astype(np.int32), xs.astype(np.int32)]))
-        min_degree = int(np.min(degree[ys.astype(np.int32), xs.astype(np.int32)]))
-        kind = "branch" if max_degree >= 3 else "terminal" if min_degree <= 1 else "pass"
+        yi = ys.astype(np.int32)
+        xi = xs.astype(np.int32)
+        max_degree = int(np.max(degree[yi, xi]))
+        min_degree = int(np.min(degree[yi, xi]))
+        if float(np.max(labels.junction[yi, xi])) >= args.junction_threshold:
+            kind = "branch"
+        elif float(np.max(labels.endpoint[yi, xi])) >= args.endpoint_threshold or min_degree <= 1:
+            kind = "terminal"
+        elif max_degree >= 3:
+            kind = "branch"
+        else:
+            kind = "pass"
         nodes.append(InternalNode(node_id, component, float(np.mean(xs)), float(np.mean(ys)), kind))
         for y, x in component:
             label_map[y, x] = node_id
@@ -631,9 +691,9 @@ def trace_edge_from_node(
         visited_links.add(link)
         points.append(current)
         node_id = int(label_map[current])
-        if node_id >= 0 and node_id != start_node:
+        if node_id >= 0 and (node_id != start_node or len(points) > 2):
             return node_id, np.array([(x, y) for y, x in points], dtype=np.float32)
-        candidates = [p for p in pixel_neighbors(current, mask) if p != previous]
+        candidates = [p for p in topology_neighbors(current, mask) if p != previous]
         if not candidates:
             return node_id if node_id >= 0 else start_node, np.array([(x, y) for y, x in points], dtype=np.float32)
         if len(candidates) > 1:
@@ -646,7 +706,7 @@ def build_internal_edges(nodes: list[InternalNode], label_map: np.ndarray, mask:
     visited_links: set[tuple[Pixel, Pixel]] = set()
     for node in nodes:
         for pixel in node.pixels:
-            for nbr in pixel_neighbors(pixel, mask):
+            for nbr in topology_neighbors(pixel, mask):
                 if int(label_map[nbr]) == node.id:
                     continue
                 traced = trace_edge_from_node(mask, label_map, node.id, pixel, nbr, visited_links, labels)
@@ -691,7 +751,8 @@ def compose_internal_edges(edges: list[InternalEdge], nodes: list[InternalNode],
     incident: dict[int, list[InternalEdge]] = {node.id: [] for node in nodes}
     for edge in edges:
         incident.setdefault(edge.u, []).append(edge)
-        incident.setdefault(edge.v, []).append(edge)
+        if edge.v != edge.u:
+            incident.setdefault(edge.v, []).append(edge)
 
     starts = sorted(
         edges,
@@ -716,6 +777,15 @@ def compose_internal_edges(edges: list[InternalEdge], nodes: list[InternalNode],
             oriented = orient_internal_edge(current_edge, current_node)
             parts.append(oriented if not parts else oriented[1:])
             current_node = other_internal_node(current_edge, current_node)
+            while True:
+                loops = [edge for edge in incident.get(current_node, []) if not edge.used and edge.u == edge.v == current_node]
+                if not loops:
+                    break
+                loops.sort(key=lambda edge: (-len(edge.points), edge.id))
+                loop = loops[0]
+                loop.used = True
+                loop_points = orient_internal_edge(loop, current_node)
+                parts.append(loop_points[1:])
             available = [edge for edge in incident.get(current_node, []) if not edge.used and edge.id != current_edge.id]
             if not available:
                 break
@@ -738,7 +808,7 @@ def trace_branched_component(
     labels: StructureLabels,
     args: argparse.Namespace,
 ) -> list[np.ndarray]:
-    nodes, label_map = build_node_map(mask, terminals, args)
+    nodes, label_map = build_node_map(mask, terminals, labels, args)
     edges = build_internal_edges(nodes, label_map, mask, labels)
     if not edges:
         simple = trace_simple_component(mask, terminals, labels)
@@ -747,7 +817,7 @@ def trace_branched_component(
 
 
 def component_has_branches(mask: np.ndarray, args: argparse.Namespace) -> bool:
-    degree = neighbor_count(mask)
+    degree = topology_neighbor_count(mask)
     branch_pixels = int(np.count_nonzero(mask & (degree >= 3)))
     return branch_pixels > args.branch_pixel_tolerance
 
@@ -1152,6 +1222,8 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         "terminal_continue_min_score": args.terminal_continue_min_score,
         "simplification_epsilon": args.simplification_epsilon,
         "centreline_thinning": not args.disable_centreline_thinning,
+        "branch_pixel_tolerance": args.branch_pixel_tolerance,
+        "raster_branch_node_radius_px": args.raster_branch_node_radius_px,
         "max_draw_jump_px": args.max_draw_jump_px,
         "jump_support_fraction": args.jump_support_fraction,
     }
@@ -1198,7 +1270,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-stroke-length-px", type=float, default=2.0)
     parser.add_argument("--spur-prune-length-px", type=int, default=2)
     parser.add_argument("--disable-centreline-thinning", action="store_true")
-    parser.add_argument("--branch-pixel-tolerance", type=int, default=999999)
+    parser.add_argument("--branch-pixel-tolerance", type=int, default=0)
+    parser.add_argument("--raster-branch-node-radius-px", type=int, default=1)
     parser.add_argument("--component-route-min-coverage", type=float, default=0.72)
     parser.add_argument("--reroute-min-component-coverage", type=float, default=0.72)
     parser.add_argument("--max-bridge-gap-px", type=float, default=8.0)
@@ -1206,7 +1279,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bridge-iterations", type=int, default=2)
     parser.add_argument("--bridge-support-fraction", type=float, default=0.45)
     parser.add_argument("--bridge-tangent-min", type=float, default=0.35)
-    parser.add_argument("--post-merge-gap-px", type=float, default=10.0)
+    parser.add_argument("--post-merge-gap-px", type=float, default=15.0)
     parser.add_argument("--post-merge-support-fraction", type=float, default=0.35)
     parser.add_argument("--post-merge-tangent-min", type=float, default=0.25)
     parser.add_argument("--branch-continue-min-score", type=float, default=0.15)
