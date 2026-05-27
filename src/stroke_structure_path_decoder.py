@@ -48,6 +48,7 @@ from stroke_based_pipeline import (
     save_json,
     simplify_polyline,
     validate_arduino_commands,
+    zhang_suen_thinning,
 )
 
 
@@ -76,6 +77,8 @@ class PathDecoderDiagnostics:
     pre_merge_stroke_count: int
     post_merge_stroke_count: int
     dropped_short_stroke_count: int
+    centreline_pixels_before_thinning: int
+    centreline_pixels_after_thinning: int
 
 
 @dataclass
@@ -310,6 +313,23 @@ def remove_small_components(mask: np.ndarray, min_pixels: int) -> np.ndarray:
     return output
 
 
+def prepare_centreline_mask(labels: StructureLabels, args: argparse.Namespace) -> tuple[np.ndarray, int, int]:
+    """Prepare the drawable centreline ridge.
+
+    The model centreline head is often a good localization signal but may still
+    be multiple pixels wide. The plotter should draw a path through that signal,
+    not fill its area, so the decoder works on a thinned ridge and keeps the
+    support mask only for gap/merge scoring.
+    """
+    centreline = labels.centreline.astype(bool)
+    before = int(np.count_nonzero(centreline))
+    if not args.disable_centreline_thinning:
+        centreline = zhang_suen_thinning(centreline)
+    centreline = remove_small_components(centreline, args.min_component_pixels)
+    after = int(np.count_nonzero(centreline))
+    return centreline, before, after
+
+
 def prune_short_spurs(mask: np.ndarray, protected: np.ndarray, max_length: int) -> np.ndarray:
     if max_length <= 0:
         return mask.astype(bool).copy()
@@ -515,6 +535,33 @@ def coverage_walk_component(
     start = terminals[0] if terminals else degree_endpoints[0] if degree_endpoints else tuple(map(int, np.argwhere(mask)[0]))
     path = edge_cover_walk(mask, start, labels)
     return np.array([(x, y) for y, x in path], dtype=np.float32)
+
+
+def reroute_retracing_stroke(stroke: np.ndarray, mask: np.ndarray, labels: StructureLabels, args: argparse.Namespace) -> np.ndarray:
+    """Replace obvious backtracking walks with a simpler endpoint route.
+
+    Coverage walks are useful diagnostics, but they can contain repeated visits
+    to the same line. If a walk is much longer than the component it covers, use
+    the best endpoint-to-endpoint route through the thinned centreline instead.
+    """
+    if len(stroke) < 4:
+        return stroke
+    unique_pixels = {xy_to_yx(point) for point in stroke}
+    if len(unique_pixels) == 0 or len(stroke) <= len(unique_pixels) * 1.35:
+        return stroke
+    endpoints = component_degree_endpoints(mask)
+    route = longest_shortest_path(mask, endpoints) if len(endpoints) >= 2 else []
+    if not route:
+        return stroke
+    routed = np.array([(x, y) for y, x in route], dtype=np.float32)
+    route_coverage = component_route_coverage([routed], mask)
+    if (
+        len(routed) >= 2
+        and route_coverage >= args.reroute_min_component_coverage
+        and polyline_length(routed) < polyline_length(stroke) * 0.8
+    ):
+        return routed
+    return stroke
 
 
 def component_terminals(component_mask_: np.ndarray, terminals: list[EvidencePoint], args: argparse.Namespace) -> list[Pixel]:
@@ -737,6 +784,49 @@ def split_simplify_with_corners(
     return simplify_polyline(stroke.astype(np.float32), args.simplification_epsilon).astype(np.float32)
 
 
+def collapse_consecutive_duplicates(stroke: np.ndarray) -> np.ndarray:
+    if len(stroke) <= 1:
+        return stroke
+    kept = [stroke[0]]
+    for point in stroke[1:]:
+        if np.linalg.norm(point - kept[-1]) > 1e-6:
+            kept.append(point)
+    return np.array(kept, dtype=np.float32)
+
+
+def split_at_unsupported_pen_down_jumps(stroke: np.ndarray, labels: StructureLabels, args: argparse.Namespace) -> list[np.ndarray]:
+    """Guard against simplification-created jumps through empty space."""
+    if len(stroke) < 2:
+        return [stroke]
+    pieces: list[list[np.ndarray]] = [[stroke[0]]]
+    for start, end in zip(stroke[:-1], stroke[1:]):
+        start_pixel = xy_to_yx(start)
+        end_pixel = xy_to_yx(end)
+        jump = float(np.linalg.norm(end - start)) > args.max_draw_jump_px
+        unsupported = support_fraction_between(labels, start_pixel, end_pixel) < args.jump_support_fraction
+        if jump and unsupported:
+            pieces.append([end])
+        else:
+            pieces[-1].append(end)
+    return [np.array(piece, dtype=np.float32) for piece in pieces if len(piece) >= args.min_points]
+
+
+def orient_single_stroke_from_endpoints(strokes: list[np.ndarray], terminal_hints: list[EvidencePoint]) -> list[np.ndarray]:
+    actual_endpoints = [point for point in terminal_hints if point.kind == "endpoint"]
+    if len(strokes) != 1 or len(actual_endpoints) < 2:
+        return strokes
+    left = min(actual_endpoints, key=lambda point: (point.x, point.y))
+    right = max(actual_endpoints, key=lambda point: (point.x, point.y))
+    stroke = strokes[0]
+    start = xy_to_yx(stroke[0])
+    end = xy_to_yx(stroke[-1])
+    normal_score = distance_px(start, left.pixel) + distance_px(end, right.pixel)
+    reversed_score = distance_px(start, right.pixel) + distance_px(end, left.pixel)
+    if reversed_score < normal_score:
+        return [stroke[::-1].copy()]
+    return strokes
+
+
 def merge_oriented_strokes(first: np.ndarray, first_end: int, second: np.ndarray, second_end: int) -> np.ndarray:
     left = first[::-1].copy() if first_end == 0 else first
     right = second if second_end == 0 else second[::-1].copy()
@@ -783,7 +873,7 @@ def merge_close_strokes(
 
 
 def decode_path_first(labels: StructureLabels, args: argparse.Namespace) -> tuple[DecodeResult, PathDecoderDiagnostics]:
-    base_mask = remove_small_components(labels.centreline.astype(bool), args.min_component_pixels)
+    base_mask, centreline_before, centreline_after = prepare_centreline_mask(labels, args)
     endpoints = snap_evidence_points("endpoint", labels.endpoint, args.endpoint_threshold, base_mask, args.evidence_snap_radius_px)
     corners = snap_evidence_points("corner", labels.corner, args.corner_threshold, base_mask, args.evidence_snap_radius_px)
     junctions = snap_evidence_points("junction", labels.junction, args.junction_threshold, base_mask, args.evidence_snap_radius_px)
@@ -813,6 +903,7 @@ def decode_path_first(labels: StructureLabels, args: argparse.Namespace) -> tupl
             component_strokes = [stroke] if len(stroke) >= args.min_points else []
         if component_route_coverage(component_strokes, mask) < args.component_route_min_coverage:
             fallback = coverage_walk_component(mask, terminals, labels)
+            fallback = reroute_retracing_stroke(fallback, mask, labels, args)
             if len(fallback) >= args.min_points:
                 component_strokes = [fallback]
         raw_strokes.extend(component_strokes)
@@ -826,11 +917,13 @@ def decode_path_first(labels: StructureLabels, args: argparse.Namespace) -> tupl
         if len(stroke) < args.min_points or polyline_length(stroke) < args.min_stroke_length_px:
             dropped += 1
             continue
-        simplified_stroke = split_simplify_with_corners(stroke, corner_points, args)
-        if len(simplified_stroke) < args.min_points or polyline_length(simplified_stroke) < args.min_stroke_length_px:
-            dropped += 1
-            continue
-        simplified.append(simplified_stroke.astype(np.float32))
+        simplified_stroke = collapse_consecutive_duplicates(split_simplify_with_corners(stroke, corner_points, args))
+        for piece in split_at_unsupported_pen_down_jumps(simplified_stroke, labels, args):
+            if len(piece) < args.min_points or polyline_length(piece) < args.min_stroke_length_px:
+                dropped += 1
+                continue
+            simplified.append(piece.astype(np.float32))
+    simplified = orient_single_stroke_from_endpoints(simplified, terminal_hints)
 
     claimed = claimed_pixels_from_strokes(simplified, labels.support.shape, radius=args.coverage_radius_px) & labels.support
     missed = labels.support & ~claimed
@@ -872,6 +965,8 @@ def decode_path_first(labels: StructureLabels, args: argparse.Namespace) -> tupl
         pre_merge_stroke_count=pre_merge_count,
         post_merge_stroke_count=post_merge_count,
         dropped_short_stroke_count=dropped,
+        centreline_pixels_before_thinning=centreline_before,
+        centreline_pixels_after_thinning=centreline_after,
     )
     return result, diagnostics
 
@@ -1056,6 +1151,9 @@ def run_pipeline(args: argparse.Namespace) -> dict:
         "branch_continue_min_score": args.branch_continue_min_score,
         "terminal_continue_min_score": args.terminal_continue_min_score,
         "simplification_epsilon": args.simplification_epsilon,
+        "centreline_thinning": not args.disable_centreline_thinning,
+        "max_draw_jump_px": args.max_draw_jump_px,
+        "jump_support_fraction": args.jump_support_fraction,
     }
     save_arduino_commands(commands, output_dir / "arduino_commands.txt")
     save_json(metrics, output_dir / "stroke_metrics.json")
@@ -1083,7 +1181,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prediction-arrays")
     parser.add_argument("--output-dir", default="output/stroke_structure_path_decoder")
     parser.add_argument("--support-threshold", type=float, default=0.45)
-    parser.add_argument("--centreline-threshold", type=float, default=0.45)
+    parser.add_argument("--centreline-threshold", type=float, default=0.30)
     parser.add_argument("--endpoint-threshold", type=float, default=0.35)
     parser.add_argument("--corner-threshold", type=float, default=0.35)
     parser.add_argument("--junction-threshold", type=float, default=0.35)
@@ -1099,8 +1197,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-component-pixels", type=int, default=4)
     parser.add_argument("--min-stroke-length-px", type=float, default=2.0)
     parser.add_argument("--spur-prune-length-px", type=int, default=2)
-    parser.add_argument("--branch-pixel-tolerance", type=int, default=3)
+    parser.add_argument("--disable-centreline-thinning", action="store_true")
+    parser.add_argument("--branch-pixel-tolerance", type=int, default=999999)
     parser.add_argument("--component-route-min-coverage", type=float, default=0.72)
+    parser.add_argument("--reroute-min-component-coverage", type=float, default=0.72)
     parser.add_argument("--max-bridge-gap-px", type=float, default=8.0)
     parser.add_argument("--close-loop-gap-px", type=float, default=5.0)
     parser.add_argument("--bridge-iterations", type=int, default=2)
@@ -1113,6 +1213,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--terminal-continue-min-score", type=float, default=0.55)
     parser.add_argument("--simplification-epsilon", type=float, default=2.5)
     parser.add_argument("--corner-preserve-radius-px", type=float, default=5.0)
+    parser.add_argument("--max-draw-jump-px", type=float, default=80.0)
+    parser.add_argument("--jump-support-fraction", type=float, default=0.35)
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)
