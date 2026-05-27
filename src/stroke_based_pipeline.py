@@ -1464,6 +1464,57 @@ def save_gantry_preview(
     image.save(output_path)
 
 
+def save_gantry_physical_preview(
+    paths_mm: list[np.ndarray],
+    output_path: Path,
+    work_w_mm: float,
+    work_h_mm: float,
+    margin_mm: float,
+    dpi: float = 600.0,
+    pen_width_mm: float = 0.35,
+) -> None:
+    """Render gantry coordinates at physical scale using a real pen width."""
+    px_per_mm = dpi / 25.4
+    width_px = max(1, int(round(work_w_mm * px_per_mm)))
+    height_px = max(1, int(round(work_h_mm * px_per_mm)))
+    line_width_px = max(1, int(round(pen_width_mm * px_per_mm)))
+    image = Image.new("RGB", (width_px, height_px), "white")
+    draw = ImageDraw.Draw(image)
+
+    def to_canvas(point: tuple[float, float]) -> tuple[float, float]:
+        x, y = point
+        return x * px_per_mm, y * px_per_mm
+
+    margin_px = max(1, int(round(0.10 * px_per_mm)))
+    draw.rectangle(
+        (0, 0, width_px - 1, height_px - 1),
+        outline=(230, 230, 230),
+        width=max(1, margin_px),
+    )
+    draw.rectangle(
+        (
+            margin_mm * px_per_mm,
+            margin_mm * px_per_mm,
+            (work_w_mm - margin_mm) * px_per_mm,
+            (work_h_mm - margin_mm) * px_per_mm,
+        ),
+        outline=(245, 245, 245),
+        width=max(1, int(round(0.05 * px_per_mm))),
+    )
+
+    radius = line_width_px / 2.0
+    for path in paths_mm:
+        if len(path) < 2:
+            continue
+        points = [to_canvas((float(x), float(y))) for x, y in path]
+        draw.line(points, fill=(18, 18, 18), width=line_width_px, joint="curve")
+        if line_width_px > 1:
+            for x, y in points:
+                draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=(18, 18, 18))
+
+    image.save(output_path)
+
+
 def save_json(data: dict, output_path: Path) -> None:
     output_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 

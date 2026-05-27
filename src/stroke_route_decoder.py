@@ -31,6 +31,7 @@ from stroke_based_pipeline import (
     paths_to_arduino_commands,
     remove_small_components,
     save_arduino_commands,
+    save_gantry_physical_preview,
     save_gantry_preview,
     save_json,
     simplify_polyline,
@@ -1018,6 +1019,11 @@ def compute_metrics(
             "false_positive_radius_px": args.false_positive_radius_px,
             "simplification_epsilon": args.simplification_epsilon,
         },
+        "physical_preview": {
+            "dpi": args.preview_dpi,
+            "pen_width_mm": args.pen_width_mm,
+            "px_per_mm": args.preview_dpi / 25.4,
+        },
         "gantry_mapping": transform_info,
         "firmware_constants": firmware_constants,
         "model_path_used": labels.model_path,
@@ -1104,6 +1110,15 @@ def run_pipeline(args: argparse.Namespace) -> dict:
     save_arduino_commands(commands, output_dir / "arduino_commands.txt")
     save_json(metrics, output_dir / "stroke_metrics.json")
     save_gantry_preview(paths_mm, output_dir / "gantry_path_preview.png", args.work_width_mm, args.work_height_mm, args.margin_mm)
+    save_gantry_physical_preview(
+        paths_mm,
+        output_dir / "gantry_physical_preview.png",
+        args.work_width_mm,
+        args.work_height_mm,
+        args.margin_mm,
+        dpi=args.preview_dpi,
+        pen_width_mm=args.pen_width_mm,
+    )
     save_reconstruction_debug(labels, result, output_dir / "reconstruction_debug.png")
     save_route_graph_debug(labels, result, output_dir / "route_graph_debug.png")
     save_route_sequence_debug(labels, result, output_dir / "route_sequence_debug.png")
@@ -1155,6 +1170,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-width-mm", type=float, default=150.0)
     parser.add_argument("--work-height-mm", type=float, default=270.0)
     parser.add_argument("--margin-mm", type=float, default=5.0)
+    parser.add_argument("--preview-dpi", type=float, default=600.0)
+    parser.add_argument("--pen-width-mm", type=float, default=0.35)
     return parser
 
 
