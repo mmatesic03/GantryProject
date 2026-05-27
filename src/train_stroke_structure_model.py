@@ -147,6 +147,18 @@ def dice_loss_from_logits(logits, target):
     return 1.0 - dice.mean()
 
 
+def tangent_supervision_mask(targets: dict, args: argparse.Namespace):
+    valid = targets["tangent_valid"] > 0.5
+    mode = getattr(args, "tangent_supervision", "support")
+    if mode == "centreline":
+        valid = valid & (targets["centreline"] > 0.5)
+    elif mode == "support":
+        pass
+    else:
+        raise ValueError(f"Unknown tangent supervision mode: {mode}")
+    return valid.float()
+
+
 def structure_loss(outputs: dict, targets: dict, args: argparse.Namespace) -> tuple:
     total = 0.0
     parts: dict[str, float] = {}
@@ -167,15 +179,24 @@ def structure_loss(outputs: dict, targets: dict, args: argparse.Namespace) -> tu
         parts[f"{head}_bce"] = float(bce_value.detach().cpu())
         parts[f"{head}_dice"] = float(dice_value.detach().cpu())
 
-    valid = targets["tangent_valid"]
+    valid = tangent_supervision_mask(targets, args)
     target_tangent = targets["tangent"]
     pred_tangent = outputs["tangent"]
-    valid2 = valid.repeat(1, 2, 1, 1)
-    if torch.count_nonzero(valid2) > 0:
-        mse = torch.sum(((pred_tangent - target_tangent) ** 2) * valid2) / torch.clamp(torch.sum(valid2), min=1.0)
+    if torch.count_nonzero(valid) > 0:
+        valid2 = valid.repeat(1, 2, 1, 1)
+        if args.undirected_tangent_loss:
+            direct_mse = torch.sum((pred_tangent - target_tangent) ** 2, dim=1, keepdim=True)
+            reverse_mse = torch.sum((pred_tangent + target_tangent) ** 2, dim=1, keepdim=True)
+            mse = torch.sum(torch.minimum(direct_mse, reverse_mse) * valid) / torch.clamp(torch.sum(valid), min=1.0)
+        else:
+            mse = torch.sum(((pred_tangent - target_tangent) ** 2) * valid2) / torch.clamp(torch.sum(valid2), min=1.0)
         pred_norm = functional.normalize(pred_tangent, dim=1)
         target_norm = functional.normalize(target_tangent, dim=1)
-        cosine = 1.0 - torch.sum((pred_norm * target_norm) * valid2) / torch.clamp(torch.sum(valid), min=1.0)
+        dot = torch.sum(pred_norm * target_norm, dim=1, keepdim=True)
+        if args.undirected_tangent_loss:
+            cosine = 1.0 - torch.sum(torch.abs(dot) * valid) / torch.clamp(torch.sum(valid), min=1.0)
+        else:
+            cosine = 1.0 - torch.sum(dot * valid) / torch.clamp(torch.sum(valid), min=1.0)
         tangent_loss = mse + args.tangent_cosine_loss_weight * cosine
     else:
         mse = pred_tangent.sum() * 0.0
@@ -198,7 +219,8 @@ def evaluate(model, loader, device, args: argparse.Namespace) -> dict:
         head: {"intersection": 0.0, "union": 0.0, "predicted": 0.0, "target": 0.0}
         for head in MASK_HEADS
     }
-    tangent_scores: list[float] = []
+    tangent_signed_scores: list[float] = []
+    tangent_axis_scores: list[float] = []
     with torch.no_grad():
         for images, targets in loader:
             images = images.to(device)
@@ -216,15 +238,24 @@ def evaluate(model, loader, device, args: argparse.Namespace) -> dict:
                 stats[head]["union"] += float(torch.count_nonzero(pred_mask | target_mask).item())
                 stats[head]["predicted"] += float(torch.count_nonzero(pred_mask).item())
                 stats[head]["target"] += float(torch.count_nonzero(target_mask).item())
-            valid = targets["tangent_valid"] > 0.5
+            valid = tangent_supervision_mask(targets, args) > 0.5
             if torch.count_nonzero(valid) > 0:
                 pred = functional.normalize(outputs["tangent"], dim=1)
                 target = functional.normalize(targets["tangent"], dim=1)
-                score = torch.sum(torch.sum(pred * target, dim=1, keepdim=True) * valid) / torch.clamp(torch.sum(valid), min=1.0)
-                tangent_scores.append(float(score.item()))
+                dot = torch.sum(pred * target, dim=1, keepdim=True)
+                signed_score = torch.sum(dot * valid) / torch.clamp(torch.sum(valid), min=1.0)
+                axis_score = torch.sum(torch.abs(dot) * valid) / torch.clamp(torch.sum(valid), min=1.0)
+                tangent_signed_scores.append(float(signed_score.item()))
+                tangent_axis_scores.append(float(axis_score.item()))
+    tangent_signed = float(np.mean(tangent_signed_scores)) if tangent_signed_scores else 0.0
+    tangent_axis = float(np.mean(tangent_axis_scores)) if tangent_axis_scores else 0.0
     metrics = {
         "loss": total_loss / max(len(loader.dataset), 1),
-        "tangent_consistency": float(np.mean(tangent_scores)) if tangent_scores else 0.0,
+        "tangent_consistency": tangent_axis if args.undirected_tangent_loss else tangent_signed,
+        "tangent_signed_consistency": tangent_signed,
+        "tangent_axis_consistency": tangent_axis,
+        "tangent_supervision": args.tangent_supervision,
+        "undirected_tangent_loss": args.undirected_tangent_loss,
         "eval_threshold": args.eval_threshold,
         "heatmap_eval_threshold": args.heatmap_eval_threshold,
     }
@@ -445,6 +476,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--junction-loss-weight", type=float, default=1.5)
     parser.add_argument("--tangent-loss-weight", type=float, default=2.0)
     parser.add_argument("--tangent-cosine-loss-weight", type=float, default=1.0)
+    parser.add_argument("--tangent-supervision", choices=("support", "centreline"), default="support")
+    parser.add_argument("--undirected-tangent-loss", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--eval-threshold", type=float, default=0.5)
     parser.add_argument("--heatmap-eval-threshold", type=float, default=0.35)
     return parser
